@@ -91,5 +91,6 @@ The Python parser remains the source of bytecode decoding; the Rust VM handles
 instruction behavior. Remaining engine work: the original choice-window
 graphics (the current overlay follows the scripted rectangles but draws its own
 frame), save and load UI (`F5`/`F7` already capture their settings), the
-unsupported opcodes listed by `Step::Unsupported`, and the window frame timers
-that scripts poll while waiting for input.
+opcode payloads that are still guesses, and the window frame counters that
+scripts poll while waiting for input (the runner reports those as a stall
+instead of guessing).

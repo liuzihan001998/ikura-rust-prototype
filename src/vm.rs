@@ -468,11 +468,12 @@ impl Vm {
         // An unsupported instruction stays at the current PC for inspection.
         if !matches!(
             instruction.opcode,
-            0x01..=0x08
+            0x00..=0x08
                 | 0x13
                 | 0x15..=0x16
                 | 0x17
                 | 0x18
+                | 0x1A
                 | 0x1B
                 | 0x20
                 | 0x21
@@ -497,6 +498,7 @@ impl Vm {
                 | 0x48
                 | 0x49
                 | 0x4A
+                | 0x4B
                 | 0x50
                 | 0x51
                 | 0x53
@@ -504,6 +506,7 @@ impl Vm {
                 | 0x56
                 | 0x57
                 | 0x60
+                | 0x63
                 | 0x70
                 | 0x71
                 | 0x72
@@ -515,6 +518,7 @@ impl Vm {
                 | 0x78
                 | 0x79
                 | 0x7B
+                | 0x7E
                 | 0x7F
                 | 0x80
                 | 0x81
@@ -522,11 +526,13 @@ impl Vm {
                 | 0x85..=0x87
                 | 0x88
                 | 0x89
+                | 0x8F
                 | 0xA0
                 | 0xA1
                 | 0xA5
                 | 0xA6
-                | 0xE0..=0xE4
+                | 0xD6
+                | 0xE0..=0xE5
                 | 0xF0
                 | 0xF4
                 | 0xF5
@@ -569,7 +575,11 @@ impl Vm {
         match instruction.opcode {
             // The reference decoder accepts these setup instructions without
             // a runtime effect. Our variable/flag storage grows dynamically.
-            0x13 | 0x23 | 0x30 | 0x40 | 0x48 | 0x49 | 0x80 | 0xA1 | 0xA5 | 0xA6 | 0xE0..=0xE4 => {}
+            // 0x00 and 0x1A are common window/text-window setup markers used by
+            // nearly every scene script, 0x8F and 0xE5 appear in mode scripts,
+            // and 0xD6 stores a speaker display record for the message window.
+            0x00 | 0x13 | 0x1A | 0x23 | 0x30 | 0x40 | 0x48 | 0x49 | 0x80
+            | 0x8F | 0xA1 | 0xA5 | 0xA6 | 0xD6 | 0xE0..=0xE5 => {}
             0xF0 => {
                 let kind = *instruction
                     .payload
@@ -979,6 +989,11 @@ impl Vm {
                     destination_y: read(29)?,
                 }));
             }
+            // Effect/mode command used by scene scripts.
+            0x63 => {}
+            0x7E => {
+                // Flag poll: the engine re-checks this flag in a wait loop.
+            }
             0x60 => {
                 return Ok(Step::ShowSurface {
                     slot: self.decode_value(u32_at(&instruction.payload, 4)?),
@@ -987,6 +1002,17 @@ impl Vm {
             }
             // EXC is an explicit no-op in the reference implementation.
             0x4A => {}
+            0x4B => {
+                // Frame wait: the first u16 names the counter and the next byte
+                // is the frame length in milliseconds. Drive the VM clock so
+                // timer-gated loops that follow can make progress.
+                let _counter = u16_at(&instruction.payload, 0)?;
+                let frame_ms = instruction
+                    .payload
+                    .get(2)
+                    .map_or(16, |value| i32::from(*value));
+                self.now_ms = self.now_ms.saturating_add(frame_ms.max(0) as u64);
+            }
             0x55 => {
                 let duration_ms = self.decode_value(u32_at(&instruction.payload, 0)?);
                 let color: [u8; 3] = instruction
@@ -1183,6 +1209,55 @@ mod tests {
         vm.click();
         assert_eq!(vm.step().unwrap(), Step::ControlFlow);
         assert_eq!(vm.variables.get(&2), Some(&2));
+    }
+
+    #[test]
+    fn frame_wait_advances_the_timer_clock() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "START".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0xFA, &[0, 0, 0, 0]),
+                    op(1, 0x4B, &[12, 0, 20]),
+                    op(2, 0xFC, &[7, 0]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "START").unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.step().unwrap(), Step::Yield);
+        assert_eq!(vm.variables.get(&7), Some(&20));
+    }
+
+    #[test]
+    fn scene_setup_opcodes_are_accepted() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "SNR00".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x00, &[]),
+                    op(1, 0x1A, &[]),
+                    op(2, 0x8F, &[]),
+                    op(3, 0x63, &[2, 0, 5, 0, 100, 0, 0, 0]),
+                    op(4, 0x7E, &[0, 7, 0]),
+                    op(5, 0xD6, &[0, 1, 4, 1, 0xFF, 0x81, 0x75, 0]),
+                    op(6, 0xE5, &[1]),
+                    op(7, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "SNR00").unwrap();
+        for _ in 0..8 {
+            assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+        }
+        assert_eq!(vm.position(), None);
     }
 
     #[test]
