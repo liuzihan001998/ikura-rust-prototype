@@ -427,6 +427,54 @@ fn load_window_graphic(graphics: &Graphics, data_dir: &Path, name: &str) -> Opti
 /// event loop. A script that spins on state only the window can change (input,
 /// frame timers) is reported as stalled instead of failing.
 const STEP_BUDGET: usize = 10_000;
+/// How many times the runner may repeat one instruction cycle before it treats
+/// the script as waiting for a rendered frame. Scene scripts poll an animation
+/// frame counter in a tight loop, and that counter only moves when the window
+/// draws a frame.
+const CYCLE_LIMIT: u32 = 64;
+/// Longest instruction cycle recognised as an animation wait.
+const CYCLE_WINDOW: usize = 32;
+
+/// The scene scripts poll a frame counter while an animation plays. Hand out
+/// frames until either the script reaches a boundary or the budget runs out,
+/// so the window can redraw between frames.
+const FRAME_CATCHUP: usize = 600;
+/// Frames the boot path may consume before giving up on reaching the title.
+const BOOT_FRAME_BUDGET: usize = 600;
+
+#[allow(clippy::too_many_arguments)]
+fn pump_frames_until_stable(
+    vm: &mut Vm,
+    graphics: &mut Graphics,
+    data_dir: &Path,
+    ui: &mut VideoUi,
+    mut transition: Option<Transition>,
+    stalled: bool,
+) -> Result<Option<Transition>, Box<dyn Error>> {
+    let mut stalled = stalled;
+    for _ in 0..FRAME_CATCHUP {
+        if !stalled {
+            break;
+        }
+        vm.tick_frame();
+        let (next, outcome) = run_until_input_or_story(
+            vm,
+            graphics,
+            data_dir,
+            true,
+            Some(ui),
+            false,
+        )?;
+        if next.is_some() {
+            transition = next;
+        }
+        stalled = outcome == RunOutcome::Stalled;
+        if ui.quit_requested {
+            break;
+        }
+    }
+    Ok(transition)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_until_input_or_story(
@@ -439,10 +487,41 @@ fn run_until_input_or_story(
 ) -> Result<(Option<Transition>, RunOutcome), Box<dyn Error>> {
     let mut page_seen = false;
     let mut transition = None;
+    let mut history: Vec<(String, usize)> = Vec::new();
+    let mut last_cycle: Option<usize> = None;
+    let mut repeats = 0u32;
     for _ in 0..STEP_BUDGET {
         let (script, offset) = vm.position().ok_or("VM finished unexpectedly")?;
         if (stop_at_story && script == "SNR00") || (script == "TITLE" && offset == 0x7B9) {
             return Ok((transition, RunOutcome::Reached));
+        }
+        let here = (script.to_owned(), offset);
+        let cycle = history
+            .iter()
+            .rev()
+            .take(CYCLE_WINDOW)
+            .position(|seen| *seen == here)
+            .map(|back| back + 1);
+        if let Some(length) = cycle {
+            if Some(length) == last_cycle {
+                repeats += 1;
+            } else {
+                last_cycle = Some(length);
+                repeats = 0;
+            }
+        } else {
+            last_cycle = None;
+            repeats = 0;
+        }
+        if repeats >= CYCLE_LIMIT {
+            println!(
+                "VM at {script}:0x{offset:X} is waiting for a rendered frame (cycle of {last_cycle:?})"
+            );
+            return Ok((transition, RunOutcome::Stalled));
+        }
+        history.push(here);
+        if history.len() > CYCLE_WINDOW {
+            history.remove(0);
         }
         let position = format!("{script}:0x{offset:X}");
         if std::env::var_os("IKURA_TRACE_VM").is_some() {
@@ -662,15 +741,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(VideoUi::new()?)
     };
     // Begin at START's real code_start. The VM executes initialization,
-    // video playback, and title loading without jumping over setup code.
-    let (mut transition, _) = run_until_input_or_story(
-        &mut vm,
-        &mut graphics,
-        &data_dir,
-        !probe_start && std::env::var_os("IKURA_SKIP_VIDEO").is_none(),
-        video_ui.as_mut(),
-        true,
-    )?;
+    // video playback, and title loading without jumping over setup code. The
+    // boot scripts poll frame counters, so hand out frames until the title
+    // input poll is reached.
+    let mut boot_frames = 0;
+    let mut transition = loop {
+        let (transition, outcome) = run_until_input_or_story(
+            &mut vm,
+            &mut graphics,
+            &data_dir,
+            !probe_start && std::env::var_os("IKURA_SKIP_VIDEO").is_none(),
+            video_ui.as_mut(),
+            true,
+        )?;
+        if outcome == RunOutcome::Reached || boot_frames >= BOOT_FRAME_BUDGET {
+            break transition;
+        }
+        boot_frames += 1;
+        vm.tick_frame();
+    };
     if video_ui.as_ref().is_some_and(|ui| ui.quit_requested) {
         return Ok(());
     }
@@ -689,17 +778,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         vm.set_selected(Some(0));
         vm.step()?;
         vm.set_selected(None);
-        let (_, outcome) = run_until_input_or_story(
-            &mut vm,
-            &mut graphics,
-            &data_dir,
-            false,
-            None,
-            !probe_story,
-        )?;
-        if outcome == RunOutcome::Stalled {
-            println!("Story probe stalled before the first page");
-            return Ok(());
+        let mut boot_frames = 0;
+        loop {
+            let (_, outcome) = run_until_input_or_story(
+                &mut vm,
+                &mut graphics,
+                &data_dir,
+                false,
+                None,
+                !probe_story,
+            )?;
+            if outcome == RunOutcome::Reached || boot_frames >= BOOT_FRAME_BUDGET {
+                break;
+            }
+            boot_frames += 1;
+            vm.tick_frame();
         }
         println!("VM after Start: {:?}", vm.position());
         if probe_story {
@@ -727,6 +820,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .ok()
                 .and_then(|value| value.parse::<u8>().ok())
                 .unwrap_or(0);
+            let frame_budget = std::env::var("IKURA_PROBE_FRAMES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut frames_left = frame_budget;
             let mut page_count = 1;
             while page_count < page_limit {
                 if vm.waiting_for_choice() {
@@ -751,7 +849,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     None,
                     false,
                 )?;
-                if outcome == RunOutcome::Stalled && vm.text_page().is_none() {
+                if outcome == RunOutcome::Stalled {
+                    if frames_left > 0 {
+                        // The script is polling an animation frame; advance it
+                        // the way the window would and try again.
+                        frames_left -= 1;
+                        vm.tick_frame();
+                        continue;
+                    }
                     println!("Story probe stalled at {:?}", vm.position());
                     break;
                 }
@@ -777,8 +882,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut preview = false;
     let mut text_renderer: Option<TextRenderer> = None;
     let mut story_frame = StoryFrame::new();
-    // A stalled script keeps its state, so further clicks can still advance it.
-    let mut stalled = false;
     let mut choosing = false;
     let mut choice_hover: Option<u8> = None;
     let mut next_transition = transition
@@ -829,11 +932,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                             Some(&mut ui),
                             false,
                         )?;
+                        let story_transition = pump_frames_until_stable(
+                            &mut vm,
+                            &mut graphics,
+                            &data_dir,
+                            &mut ui,
+                            story_transition,
+                            outcome == RunOutcome::Stalled,
+                        )?;
                         if ui.quit_requested {
                             break 'running;
                         }
                         choosing = vm.waiting_for_choice();
-                        stalled = outcome == RunOutcome::Stalled;
                         choice_hover = None;
                         let mut frame = graphics.screen().clone();
                         if let (Some(page), Some(renderer)) =
@@ -874,7 +984,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         // Consume the pending IG, then execute its script branch.
                         vm.step()?;
                         vm.set_selected(None);
-                        let (story_transition, _) = run_until_input_or_story(
+                        let (story_transition, outcome) = run_until_input_or_story(
                             &mut vm,
                             &mut graphics,
                             &data_dir,
@@ -882,6 +992,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                             Some(&mut ui),
                             index != 0,
                         )?;
+                        let story_transition = pump_frames_until_stable(
+                            &mut vm,
+                            &mut graphics,
+                            &data_dir,
+                            &mut ui,
+                            story_transition,
+                            outcome == RunOutcome::Stalled,
+                        )?;
+                        if ui.quit_requested {
+                            break 'running;
+                        }
                         let mut frame = graphics.screen().clone();
                         if let Some(page) = vm.text_page() {
                             let renderer = TextRenderer::new()?;
@@ -919,7 +1040,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Event::MouseButtonDown {
                     mouse_btn: MouseButton::Left,
                     ..
-                } if preview && !stalled => {
+                } if preview => {
                     vm.clear_text_page();
                     vm.click();
                     let (story_transition, outcome) = run_until_input_or_story(
@@ -930,8 +1051,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Some(&mut ui),
                         false,
                     )?;
-                    if outcome == RunOutcome::Stalled {
-                        stalled = true;
+                    let story_transition = pump_frames_until_stable(
+                        &mut vm,
+                        &mut graphics,
+                        &data_dir,
+                        &mut ui,
+                        story_transition,
+                        outcome == RunOutcome::Stalled,
+                    )?;
+                    if ui.quit_requested {
+                        break 'running;
                     }
                     choosing = vm.waiting_for_choice();
                     if choosing {
@@ -945,10 +1074,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let layout = story_frame.layout(&graphics, &data_dir, &vm);
                         frame =
                             renderer.draw_page(graphics.screen(), page.speaker.as_deref(), &page.body, &layout);
-                    } else if stalled {
-                        ui.canvas
-                            .window_mut()
-                            .set_title("Script awaiting input | Esc to quit")?;
                     } else {
                         ui.canvas
                             .window_mut()
@@ -979,6 +1104,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 next_transition = None;
             }
         }
+        vm.tick_frame();
         if choosing && !vm.choice_options().is_empty() {
             let frame = TextRenderer::new()?.draw_choices(
                 graphics.screen(),

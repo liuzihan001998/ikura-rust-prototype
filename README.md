@@ -74,10 +74,14 @@ choice it takes; `IKURA_DUMP_CHOICE=/tmp/choice.png` saves the composed choice
 overlay. `IKURA_FONT` overrides the font
 file for Japanese text. `IKURA_TRACE_VM=1` prints each instruction position.
 
-A long walk stops when the script waits on state the VM cannot produce on its
-own (a frame counter or a timer owned by the window). That is reported as
-`Story probe stalled at ...` with the exact position, and the GUI shows
-`Script awaiting input` instead of dropping the script.
+Scene scripts poll an engine-owned frame counter (script register `0x1F`) in
+tight cycles while an animation or a text reveal plays. The VM models that
+counter: `Vm::tick_frame` advances it once per rendered frame, the window calls
+it every frame, and both the boot path and the GUI hand out frames until the
+script reaches a boundary. A long walk still stops if a cycle needs state the
+VM cannot produce; it is reported as `Story probe stalled at ...` with the exact
+position instead of failing, and `IKURA_PROBE_FRAMES` sets how many frames the
+headless walk may spend on such a cycle.
 
 To compose a single page with a speaker header without walking the script:
 
@@ -91,6 +95,7 @@ The Python parser remains the source of bytecode decoding; the Rust VM handles
 instruction behavior. Remaining engine work: the original choice-window
 graphics (the current overlay follows the scripted rectangles but draws its own
 frame), save and load UI (`F5`/`F7` already capture their settings), the
-opcode payloads that are still guesses, and the window frame counters that
-scripts poll while waiting for input (the runner reports those as a stall
-instead of guessing).
+opcode payloads that are still guesses, and the scene animation loop around
+`SNR00:0x456A1`. That loop guards on a flag the script never writes, so a
+scene that starts it still ends in a reported stall; `0x63` and `0x7E` are the
+likely writers and are currently accepted without effect.

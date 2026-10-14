@@ -176,6 +176,10 @@ pub struct Vm {
     speaker_names: HashMap<u8, String>,
     text_window: TextWindow,
     text_page: Option<TextPage>,
+    /// Engine-owned frame counter that scripts poll as `reg 0x1F` (animation
+    /// frame index). Scripts never write it; the window advances it once per
+    /// rendered frame.
+    frame_counter: i32,
     voice_bank: String,
     choice_options: Vec<ChoiceOption>,
     choice_selected: Option<u8>,
@@ -316,6 +320,7 @@ impl Vm {
             speaker_names: HashMap::new(),
             text_window: TextWindow::default(),
             text_page: None,
+            frame_counter: 0,
             voice_bank: "VOICE2".into(),
             choice_options: Vec::new(),
             choice_selected: None,
@@ -331,6 +336,15 @@ impl Vm {
 
     pub fn advance_clock(&mut self, milliseconds: u64) {
         self.now_ms = self.now_ms.saturating_add(milliseconds);
+    }
+
+    /// Frame counters the scripts snapshot with `CALC` before polling them:
+    /// 0x1F (text reveal), 0x20, 0x21. The scripts only read them.
+    fn frame_register(&self, index: u16) -> Option<i32> {
+        match index {
+            0x1F => Some(self.frame_counter),
+            _ => None,
+        }
     }
 
     pub fn set_selected(&mut self, selected: Option<i16>) {
@@ -357,6 +371,18 @@ impl Vm {
 
     pub fn font_size(&self) -> i32 {
         self.font_size
+    }
+
+    /// Engine frame counter polled by scripted animations.
+    #[cfg(test)]
+    pub fn frame_counter(&self) -> i32 {
+        self.frame_counter
+    }
+
+    /// Advance one rendered frame. The window calls this every frame; scripts
+    /// that poll a frame counter only make progress while this runs.
+    pub fn tick_frame(&mut self) {
+        self.frame_counter = self.frame_counter.saturating_add(1);
     }
 
     pub fn text_page(&self) -> Option<&TextPage> {
@@ -405,10 +431,11 @@ impl Vm {
 
     fn decode_value(&self, raw: u32) -> i32 {
         let value = if raw & 0x8000_0000 != 0 {
-            *self
-                .variables
-                .get(&((raw & 0x7FFF_FFFF) as u16))
-                .unwrap_or(&0) as u32
+            let index = (raw & 0x7FFF_FFFF) as u16;
+            match self.frame_register(index) {
+                Some(value) => value as u32,
+                None => *self.variables.get(&index).unwrap_or(&0) as u32,
+            }
         } else {
             raw
         };
@@ -699,6 +726,7 @@ impl Vm {
                     return Ok(Step::ControlFlow);
                 }
                 self.text_page = Some(page.clone());
+                self.frame_counter = 0;
                 return Ok(Step::TextPage(page));
             }
             0x01 | 0x02 => {
@@ -1003,15 +1031,12 @@ impl Vm {
             // EXC is an explicit no-op in the reference implementation.
             0x4A => {}
             0x4B => {
-                // Frame wait: the first u16 names the counter and the next byte
-                // is the frame length in milliseconds. Drive the VM clock so
-                // timer-gated loops that follow can make progress.
-                let _counter = u16_at(&instruction.payload, 0)?;
-                let frame_ms = instruction
-                    .payload
-                    .get(2)
-                    .map_or(16, |value| i32::from(*value));
-                self.now_ms = self.now_ms.saturating_add(frame_ms.max(0) as u64);
+                // Frame tick. The payload names the frame length in
+                // milliseconds; the engine also owns the text-reveal counter
+                // that scene scripts poll as `reg 0x1F` (x12ms per character).
+                let frame_ms = u16_at(&instruction.payload, 0)?;
+                self.now_ms = self.now_ms.saturating_add(u64::from(frame_ms));
+                self.tick_frame();
             }
             0x55 => {
                 let duration_ms = self.decode_value(u32_at(&instruction.payload, 0)?);
@@ -1212,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_wait_advances_the_timer_clock() {
+    fn frame_tick_advances_the_clock_and_the_reveal_counter() {
         let mut scripts = Scripts::new();
         scripts.insert(
             "START".into(),
@@ -1221,16 +1246,21 @@ mod tests {
                 vec![],
                 vec![
                     op(0, 0xFA, &[0, 0, 0, 0]),
-                    op(1, 0x4B, &[12, 0, 20]),
-                    op(2, 0xFC, &[7, 0]),
+                    op(1, 0x4B, &[20, 0]),
+                    // register 7 = frame counter 0x1F (reveal progress)
+                    op(2, 0x44, &[7, 0, 0, 0x1F, 0, 0, 0x80, 5]),
+                    op(3, 0xFC, &[9, 0]),
                 ],
             ),
         );
         let mut vm = Vm::new(scripts, "START").unwrap();
         vm.step().unwrap();
         vm.step().unwrap();
+        assert_eq!(vm.frame_counter(), 1);
+        vm.step().unwrap();
+        assert_eq!(vm.variables.get(&7), Some(&1));
         assert_eq!(vm.step().unwrap(), Step::Yield);
-        assert_eq!(vm.variables.get(&7), Some(&20));
+        assert_eq!(vm.variables.get(&9), Some(&20), "20ms frame advanced the clock");
     }
 
     #[test]
