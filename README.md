@@ -95,7 +95,9 @@ The Python parser remains the source of bytecode decoding; the Rust VM handles
 instruction behavior. Remaining engine work: the original choice-window
 graphics (the current overlay follows the scripted rectangles but draws its own
 frame), save and load UI (`F5`/`F7` already capture their settings), the
-opcode payloads that are still guesses, and the scene animation loop around
-`SNR00:0x456A1`. That loop guards on a flag the script never writes, so a
-scene that starts it still ends in a reported stall; `0x63` and `0x7E` are the
-likely writers and are currently accepted without effect.
+opcode payloads that are still guesses, and the scene animation loop that
+starts at `SNR00:0x4590F`. The frame counter model takes that guard out of its
+inner equality, but the loop's outer guard reads register `0x0E`, which scene
+scripts never write; a scene that enters the loop therefore still ends in a
+reported stall. `0x63`, `0x7E` and `0xD6` are the likely writers of that
+engine flag and are currently accepted without effect.
