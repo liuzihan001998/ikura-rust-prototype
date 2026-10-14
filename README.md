@@ -24,7 +24,8 @@ through the first scene background and `PM` text pages. Japanese text is
 decoded from Shift-JIS and composed into the original message-box graphic
 (`KA_M.GG2`) at the window origin from `START`'s setup; the speaker line from a
 `PM` speaker command uses the `SETFONTCOLOR` name palette, and pages advance on
-mouse click. Timed `GO` fades and `GP` transition commands cross-fade over
+mouse click. Scripted choices render from their `CSET` rectangles with a
+hover highlight and select the branch with a click. Timed `GO` fades and `GP` transition commands cross-fade over
 their scripted duration instead of landing instantly. Music requests resolve to
 the extracted OGG files: `ML` starts looping playback through SDL_mixer, `MS`
 stops it, and `SER` plays sound effects. Recorded voice plays from the bank
@@ -69,7 +70,8 @@ Both probes skip video playback. For a normal GUI run,
 surface during the probe. `IKURA_DUMP_STORY=/tmp/story.png` saves the first
 composed story page during `--probe-story`; `IKURA_PROBE_PAGES` and
 `IKURA_PROBE_CHOICE` control how far the headless story walk goes and which
-choice it takes. `IKURA_FONT` overrides the font
+choice it takes; `IKURA_DUMP_CHOICE=/tmp/choice.png` saves the composed choice
+overlay. `IKURA_FONT` overrides the font
 file for Japanese text. `IKURA_TRACE_VM=1` prints each instruction position.
 
 A long walk stops when the script waits on state the VM cannot produce on its
@@ -86,6 +88,8 @@ cargo run --example story_probe -- /Users/a1/Desktop/dev/ikura/game_data /tmp/pa
 ## Next work
 
 The Python parser remains the source of bytecode decoding; the Rust VM handles
-instruction behavior. Remaining engine work: the menu/choice window graphics,
-save and load UI (`F5`/`F7` already capture their settings), the unsupported
-opcodes listed by `Step::Unsupported`, and window-graphic animation frames.
+instruction behavior. Remaining engine work: the original choice-window
+graphics (the current overlay follows the scripted rectangles but draws its own
+frame), save and load UI (`F5`/`F7` already capture their settings), the
+unsupported opcodes listed by `Step::Unsupported`, and the window frame timers
+that scripts poll while waiting for input.

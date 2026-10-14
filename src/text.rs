@@ -2,6 +2,7 @@
 //! mirrors the original text window: `KA_M.GG2` for the message box and the
 //! `SETFONTCOLOR` palette for speaker names and body text.
 
+use crate::vm::ChoiceOption;
 use fontdue::{Font, FontSettings};
 use image::{Rgba, RgbaImage};
 use std::collections::HashMap;
@@ -214,6 +215,44 @@ impl TextRenderer {
         }
     }
 
+    /// Compose the choice overlay over `background`. Mouse hover lightens the
+    /// row under the cursor; both rows use the scripted `CSET` rectangles.
+    pub fn draw_choices(
+        &self,
+        background: &RgbaImage,
+        choices: &[ChoiceOption],
+        hover: Option<u8>,
+    ) -> RgbaImage {
+        let mut frame = background.clone();
+        let px = 20.0;
+        for choice in choices {
+            if choice.width <= 0 || choice.height <= 0 {
+                continue;
+            }
+            let hovered = hover == Some(choice.value);
+            for y in choice.y.max(0)..(choice.y + choice.height).min(frame.height() as i32) {
+                for x in choice.x.max(0)..(choice.x + choice.width).min(frame.width() as i32) {
+                    let pixel = frame.get_pixel_mut(x as u32, y as u32);
+                    for channel in 0..3 {
+                        pixel[channel] = if hovered { 96 } else { 40 };
+                    }
+                    pixel[3] = 255;
+                }
+            }
+            let baseline = choice.y + self.ascent(px).ceil() as i32;
+            self.draw_line(
+                &mut frame,
+                &choice.caption,
+                choice.x + 6,
+                baseline,
+                choice.width - 12,
+                px,
+                if hovered { [255, 236, 140] } else { [235, 235, 235] },
+            );
+        }
+        frame
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_line(
         &self,
@@ -375,6 +414,42 @@ mod tests {
             .filter(|&(x, y)| frame.get_pixel(x as u32, y as u32).0 != [0, 0, 0, 255])
             .count();
         assert_eq!(rows_below, 0, "text leaked outside the window box");
+    }
+
+    #[test]
+    fn choice_overlay_fills_the_scripted_rectangles_only() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let background = RgbaImage::from_pixel(640, 480, Rgba([10, 20, 30, 255]));
+        let choices = vec![
+            ChoiceOption {
+                value: 0,
+                caption: "我慢する".into(),
+                x: 16,
+                y: 16,
+                width: 520,
+                height: 20,
+            },
+            ChoiceOption {
+                value: 1,
+                caption: "振り返る".into(),
+                x: 16,
+                y: 40,
+                width: 520,
+                height: 20,
+            },
+        ];
+        let frame = renderer.draw_choices(&background, &choices, Some(1));
+        assert_eq!(frame.get_pixel(300, 300).0, [10, 20, 30, 255]);
+        assert_eq!(frame.get_pixel(20, 18).0, [40, 40, 40, 255]);
+        assert_eq!(frame.get_pixel(20, 42).0, [96, 96, 96, 255]);
+        // Captions leave brighter pixels than the row fill.
+        let caption_pixels = (16..120)
+            .flat_map(|x| (16..60).map(move |y| (x, y)))
+            .filter(|&(x, y)| frame.get_pixel(x, y)[0] > 150)
+            .count();
+        assert!(caption_pixels > 40, "expected captions, got {caption_pixels}");
     }
 
     #[test]

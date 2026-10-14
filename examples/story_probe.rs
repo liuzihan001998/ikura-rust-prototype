@@ -1,4 +1,7 @@
 //! Visual probe: compose one story page with a speaker header.
+#![allow(dead_code)]
+#[path = "../src/vm.rs"]
+mod vm;
 #[path = "../src/text.rs"]
 mod text;
 

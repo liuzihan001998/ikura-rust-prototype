@@ -33,6 +33,11 @@ pub struct HitArea {
 pub struct ChoiceOption {
     pub value: u8,
     pub caption: String,
+    /// Text box of this choice in screen pixels, taken from `CSET`.
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 /// One decoded `PM` page: an optional speaker name plus the body text.
@@ -614,6 +619,10 @@ impl Vm {
             // is separate from the VM's control flow.
             0x15 => {
                 let value = *instruction.payload.get(1).ok_or("CSET value missing")?;
+                let x = i32::from(u16_at(&instruction.payload, 2)?);
+                let y = i32::from(u16_at(&instruction.payload, 6)?);
+                let width = i32::from(u16_at(&instruction.payload, 10)?);
+                let height = i32::from(u16_at(&instruction.payload, 14)?);
                 let caption_bytes = instruction
                     .payload
                     .get(18..)
@@ -623,7 +632,14 @@ impl Vm {
                     .position(|&byte| byte == 0)
                     .unwrap_or(caption_bytes.len());
                 let caption = shift_jis_string(&caption_bytes[..end])?;
-                self.choice_options.push(ChoiceOption { value, caption });
+                self.choice_options.push(ChoiceOption {
+                    value,
+                    caption,
+                    x,
+                    y,
+                    width,
+                    height,
+                });
             }
             0x16 | 0x1B | 0x29 | 0x2A => {}
             0x17 => {

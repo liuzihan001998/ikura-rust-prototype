@@ -183,6 +183,18 @@ fn menu_at(vm: &Vm, x: i32, y: i32) -> Option<usize> {
     (0..4).find(|&index| menu_rect(vm, index).is_some_and(|area| area.contains_point((x, y))))
 }
 
+fn choice_at(vm: &Vm, x: i32, y: i32) -> Option<u8> {
+    vm.choice_options()
+        .iter()
+        .find(|option| {
+            x >= option.x
+                && x < option.x + option.width
+                && y >= option.y
+                && y < option.y + option.height
+        })
+        .map(|option| option.value)
+}
+
 fn draw(
     canvas: &mut Canvas<Window>,
     title: &Texture,
@@ -719,6 +731,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             while page_count < page_limit {
                 if vm.waiting_for_choice() {
                     println!("Story choices: {:?}", vm.choice_options());
+                    if let Some(path) = std::env::var_os("IKURA_DUMP_CHOICE") {
+                        let renderer = TextRenderer::new()?;
+                        renderer
+                            .draw_choices(graphics.screen(), vm.choice_options(), Some(choice_value))
+                            .save(path)?;
+                    }
                     vm.choose(choice_value)?;
                     println!("Story probe selected choice {choice_value}");
                 } else {
@@ -757,10 +775,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut background = texture_from_rgba(&creator, graphics.screen())?;
     let mut hover = None;
     let mut preview = false;
-    let mut text_renderer = None;
+    let mut text_renderer: Option<TextRenderer> = None;
     let mut story_frame = StoryFrame::new();
     // A stalled script keeps its state, so further clicks can still advance it.
     let mut stalled = false;
+    let mut choosing = false;
+    let mut choice_hover: Option<u8> = None;
     let mut next_transition = transition
         .take()
         .map(|transition| PendingTransition {
@@ -786,8 +806,59 @@ fn main() -> Result<(), Box<dyn Error>> {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => break 'running,
+                Event::MouseMotion { x, y, .. } if choosing => {
+                    choice_hover = choice_at(&vm, x, y);
+                }
                 Event::MouseMotion { x, y, .. } if !preview => {
                     hover = menu_at(&vm, x, y);
+                }
+                Event::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } if choosing => {
+                    if let Some(value) = choice_at(&vm, x, y) {
+                        vm.choose(value)?;
+                        println!("Choice {value} selected");
+                        let (story_transition, outcome) = run_until_input_or_story(
+                            &mut vm,
+                            &mut graphics,
+                            &data_dir,
+                            true,
+                            Some(&mut ui),
+                            false,
+                        )?;
+                        if ui.quit_requested {
+                            break 'running;
+                        }
+                        choosing = vm.waiting_for_choice();
+                        stalled = outcome == RunOutcome::Stalled;
+                        choice_hover = None;
+                        let mut frame = graphics.screen().clone();
+                        if let (Some(page), Some(renderer)) =
+                            (vm.text_page(), text_renderer.as_ref())
+                        {
+                            let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                            frame = renderer.draw_page(
+                                graphics.screen(),
+                                page.speaker.as_deref(),
+                                &page.body,
+                                &layout,
+                            );
+                        }
+                        if choosing {
+                            vm.clear_text_page();
+                        }
+                        if let Some(story_transition) = story_transition {
+                            next_transition = Some(PendingTransition {
+                                transition: story_transition,
+                                final_frame: frame,
+                            });
+                        } else if !choosing {
+                            background = texture_from_rgba(&creator, &frame)?;
+                        }
+                    }
                 }
                 Event::MouseButtonDown {
                     x,
@@ -831,12 +902,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                             break 'running;
                         }
                         println!("Menu choice {index}: VM position {:?}", vm.position());
+                        choosing = vm.waiting_for_choice();
+                        if choosing {
+                            vm.clear_text_page();
+                        }
                         if let Some(story_transition) = story_transition {
                             next_transition = Some(PendingTransition {
                                 transition: story_transition,
                                 final_frame: frame,
                             });
-                        } else {
+                        } else if !choosing {
                             background = texture_from_rgba(&creator, &frame)?;
                         }
                     }
@@ -857,6 +932,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     )?;
                     if outcome == RunOutcome::Stalled {
                         stalled = true;
+                    }
+                    choosing = vm.waiting_for_choice();
+                    if choosing {
+                        vm.clear_text_page();
                     }
                     if ui.quit_requested {
                         break 'running;
@@ -900,7 +979,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 next_transition = None;
             }
         }
-        draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
+        if choosing && !vm.choice_options().is_empty() {
+            let frame = TextRenderer::new()?.draw_choices(
+                graphics.screen(),
+                vm.choice_options(),
+                choice_hover,
+            );
+            let overlay = texture_from_rgba(&creator, &frame)?;
+            draw(&mut ui.canvas, &title, &overlay, preview, hover, &vm)?;
+        } else {
+            draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
+        }
         if next_transition.is_none() {
             std::thread::sleep(Duration::from_millis(4));
         }
