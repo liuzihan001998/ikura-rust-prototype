@@ -55,6 +55,8 @@ fn frame_rate(path: &Path) -> Result<f64, Box<dyn Error>> {
     Ok(fps)
 }
 
+// `chunks_exact(2)` is the stable spelling of the byte-pair chunking we need.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn decode_audio(path: &Path) -> Result<Vec<i16>, Box<dyn Error>> {
     let output = Command::new(tool("ffmpeg", "IKURA_FFMPEG"))
         .args(["-nostdin", "-v", "error", "-i"])

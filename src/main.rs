@@ -4,6 +4,7 @@ mod video;
 mod vm;
 
 use graphics::Graphics;
+use image::RgbaImage;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::mixer::{self, AUDIO_S16SYS, Channel, Chunk, InitFlag, Music, Sdl2MixerContext};
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use text::TextRenderer;
+use text::{TextRenderer, TextWindowLayout};
 use video::Playback;
 use vm::{Instruction, Scripts, Step, Vm};
 
@@ -193,12 +194,12 @@ fn draw(
     canvas.set_draw_color(Color::BLACK);
     canvas.clear();
     canvas.copy(if preview { background } else { title }, None, None)?;
-    if !preview {
-        if let Some(index) = hover {
-            canvas.set_draw_color(Color::RGB(255, 225, 30));
-            if let Some(area) = menu_rect(vm, index) {
-                canvas.draw_rect(area)?;
-            }
+    if !preview
+        && let Some(index) = hover
+    {
+        canvas.set_draw_color(Color::RGB(255, 225, 30));
+        if let Some(area) = menu_rect(vm, index) {
+            canvas.draw_rect(area)?;
         }
     }
     canvas.present();
@@ -264,6 +265,144 @@ fn play_video(
     Ok(())
 }
 
+enum FrameGraphic {
+    Missing,
+    Loaded(RgbaImage),
+}
+
+/// One timed graphical transition (`GO` fade or a `GP` command that carries a
+/// duration). The VM applies the final frame immediately, so the transition
+/// cross-fades the captured before/after surfaces over the scripted time.
+struct Transition {
+    from: RgbaImage,
+    to: RgbaImage,
+    duration: Duration,
+    elapsed: Duration,
+}
+
+impl Transition {
+    fn new(from: RgbaImage, to: RgbaImage, duration_ms: i32) -> Self {
+        Self {
+            from,
+            to,
+            duration: Duration::from_millis(duration_ms.max(0) as u64),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn progress(&self) -> f64 {
+        if self.duration.is_zero() {
+            return 1.0;
+        }
+        (self.elapsed.as_secs_f64() / self.duration.as_secs_f64()).clamp(0.0, 1.0)
+    }
+
+    fn advance(&mut self, delta: Duration) -> bool {
+        self.elapsed += delta;
+        self.elapsed >= self.duration
+    }
+
+    fn frame(&self) -> RgbaImage {
+        blend_frames(&self.from, &self.to, self.progress())
+    }
+}
+
+/// A running transition plus the composed frame to show once it lands.
+struct PendingTransition {
+    transition: Transition,
+    final_frame: RgbaImage,
+}
+
+/// Linear blend between two frames; `progress` 0 keeps `from`, 1 keeps `to`.
+fn blend_frames(from: &RgbaImage, to: &RgbaImage, progress: f64) -> RgbaImage {
+    let progress = progress.clamp(0.0, 1.0);
+    let mut frame = from.clone();
+    for y in 0..frame.height().min(to.height()) {
+        for x in 0..frame.width().min(to.width()) {
+            let target = *to.get_pixel(x, y);
+            let pixel = frame.get_pixel_mut(x, y);
+            for channel in 0..4 {
+                let start = f64::from(pixel[channel]);
+                pixel[channel] = (start + (f64::from(target[channel]) - start) * progress)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    frame
+}
+
+/// The original message-box graphic plus the scripted window rectangle and
+/// `SETFONTCOLOR` palette, cached between pages.
+struct StoryFrame {
+    graphic: Option<String>,
+    template: FrameGraphic,
+}
+
+impl StoryFrame {
+    fn new() -> Self {
+        Self {
+            graphic: None,
+            template: FrameGraphic::Missing,
+        }
+    }
+
+    fn layout(&mut self, graphics: &Graphics, data_dir: &Path, vm: &Vm) -> TextWindowLayout {
+        let window = vm.text_window();
+        if self.graphic.as_deref() != window.graphic.as_deref() {
+            self.graphic = window.graphic.clone();
+            self.template = window
+                .graphic
+                .as_deref()
+                .and_then(|name| load_window_graphic(graphics, data_dir, name))
+                .map_or(FrameGraphic::Missing, FrameGraphic::Loaded);
+        }
+        TextWindowLayout {
+            x: window.x,
+            y: window.y,
+            width: window.width,
+            height: window.height,
+            font_size: vm.font_size(),
+            frame: match &self.template {
+                FrameGraphic::Loaded(image) => Some(image.clone()),
+                FrameGraphic::Missing => None,
+            },
+            colors: window.colors.clone(),
+        }
+    }
+}
+
+fn find_graphic(data_dir: &Path, name: &str) -> Option<PathBuf> {
+    let wanted = format!("{}.png", name.to_ascii_lowercase());
+    for bank in ["GGD", "GGD2"] {
+        let dir = data_dir.join("PNG-images").join(bank);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.to_ascii_lowercase() == wanted {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
+fn load_window_graphic(graphics: &Graphics, data_dir: &Path, name: &str) -> Option<RgbaImage> {
+    if let Some(slot) = graphics.slot_of(name) {
+        let pixels = graphics.surface(slot)?.clone();
+        println!("Story window graphic {name} from graphic slot {slot}");
+        return Some(pixels);
+    }
+    let path = find_graphic(data_dir, name)?;
+    let image = image::open(&path).ok()?;
+    println!("Story window graphic {name} from {}", path.display());
+    Some(image.to_rgba8())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_until_input_or_story(
     vm: &mut Vm,
     graphics: &mut Graphics,
@@ -271,12 +410,13 @@ fn run_until_input_or_story(
     play_movies: bool,
     mut ui: Option<&mut VideoUi>,
     stop_at_story: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<Transition>, Box<dyn Error>> {
     let mut page_seen = false;
+    let mut transition = None;
     for _ in 0..10000 {
         let (script, offset) = vm.position().ok_or("VM finished unexpectedly")?;
         if (stop_at_story && script == "SNR00") || (script == "TITLE" && offset == 0x7B9) {
-            return Ok(());
+            return Ok(transition);
         }
         let position = format!("{script}:0x{offset:X}");
         if std::env::var_os("IKURA_TRACE_VM").is_some() {
@@ -288,15 +428,31 @@ fn run_until_input_or_story(
                 println!("VM {position}: GL slot={slot} name={name} ({width}x{height})");
             }
             Step::FadeTo { duration_ms, color } => {
+                let before = graphics.screen().clone();
                 graphics.fill_screen(color);
                 println!(
                     "VM {position}: GO fade {duration_ms}ms to #{:02X}{:02X}{:02X}",
                     color[0], color[1], color[2]
                 );
+                if transition.is_none() && duration_ms > 0 {
+                    transition = Some(Transition::new(
+                        before,
+                        graphics.screen().clone(),
+                        duration_ms,
+                    ));
+                }
             }
             Step::ShowSurface { slot, duration_ms } => {
+                let before = graphics.screen().clone();
                 graphics.show_surface(slot)?;
                 println!("VM {position}: GGE slot={slot} final frame ({duration_ms}ms)");
+                if transition.is_none() && duration_ms > 0 {
+                    transition = Some(Transition::new(
+                        before,
+                        graphics.screen().clone(),
+                        duration_ms,
+                    ));
+                }
             }
             Step::MusicStopped => {
                 if let Some(ui) = ui.as_deref_mut() {
@@ -365,19 +521,30 @@ fn run_until_input_or_story(
                 }
             }
             Step::GraphicBank(bank) => graphics.set_bank(&bank)?,
-            Step::TextPage(text) => {
-                println!("VM {position}: PM text: {text}");
+            Step::TextPage(page) => {
+                match &page.speaker {
+                    Some(speaker) => println!("VM {position}: PM {speaker}: {}", page.body),
+                    None => println!("VM {position}: PM text: {}", page.body),
+                }
                 if page_seen {
-                    return Ok(());
+                    return Ok(transition);
                 }
                 page_seen = true;
             }
-            Step::InputPoll => return Ok(()),
-            Step::ChoicePoll => return Ok(()),
+            Step::InputPoll => return Ok(transition),
+            Step::ChoicePoll => return Ok(transition),
             Step::Blit(operation) => {
+                let before = graphics.screen().clone();
                 if let Err(error) = graphics.blit(&operation) {
                     println!("VM paused at {position}: {error}");
-                    return Ok(());
+                    return Ok(transition);
+                }
+                if transition.is_none() && operation.duration() > 0 {
+                    transition = Some(Transition::new(
+                        before,
+                        graphics.screen().clone(),
+                        operation.duration(),
+                    ));
                 }
             }
             Step::InitSurface {
@@ -400,7 +567,7 @@ fn run_until_input_or_story(
                     let ui = ui.as_deref_mut().ok_or("AVIP needs an SDL window")?;
                     play_video(data_dir, &name, destination_width, destination_height, ui)?;
                     if ui.quit_requested {
-                        return Ok(());
+                        return Ok(transition);
                     }
                 } else {
                     println!("VM {position}: video skipped");
@@ -408,7 +575,7 @@ fn run_until_input_or_story(
             }
             Step::Unsupported { opcode, .. } => {
                 println!("VM paused at {position}: opcode 0x{opcode:02X} is not implemented yet");
-                return Ok(());
+                return Ok(transition);
             }
             Step::Yield => vm.advance_clock(16),
             Step::Wait(milliseconds) => {
@@ -417,7 +584,7 @@ fn run_until_input_or_story(
                 }
                 vm.advance_clock(milliseconds);
             }
-            Step::Finished => return Ok(()),
+            Step::Finished => return Ok(transition),
             Step::ControlFlow => {}
         }
     }
@@ -471,7 +638,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     // Begin at START's real code_start. The VM executes initialization,
     // video playback, and title loading without jumping over setup code.
-    run_until_input_or_story(
+    let mut transition = run_until_input_or_story(
         &mut vm,
         &mut graphics,
         &data_dir,
@@ -503,9 +670,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             let page = vm
                 .text_page()
                 .ok_or("story probe did not reach a text page")?;
-            println!("First story page: {page}");
+            println!("First story page: {}", page.render());
             if let Some(path) = std::env::var_os("IKURA_DUMP_STORY") {
-                let frame = TextRenderer::new()?.draw_page(graphics.screen(), page);
+                let mut story = StoryFrame::new();
+                let layout = story.layout(&graphics, &data_dir, &vm);
+                let frame = TextRenderer::new()?.draw_page(
+                    graphics.screen(),
+                    page.speaker.as_deref(),
+                    &page.body,
+                    &layout,
+                );
                 frame.save(path)?;
             }
             let page_limit = std::env::var("IKURA_PROBE_PAGES")
@@ -531,7 +705,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if vm.waiting_for_choice() {
                     continue;
                 } else if let Some(page) = vm.text_page() {
-                    println!("Next story page: {page}");
+                    println!("Next story page: {}", page.render());
                     page_count += 1;
                 } else {
                     println!("Story probe paused at {:?}", vm.position());
@@ -549,9 +723,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut hover = None;
     let mut preview = false;
     let mut text_renderer = None;
+    let mut story_frame = StoryFrame::new();
+    let mut next_transition = transition
+        .take()
+        .map(|transition| PendingTransition {
+            transition,
+            final_frame: graphics.screen().clone(),
+        });
 
     'running: loop {
-        let pending_events: Vec<_> = ui.events.poll_iter().collect();
+        let pending_events: Vec<_> = if next_transition.is_some() {
+            // Keep animating while still handling input between frames.
+            ui.events.poll_iter().collect()
+        } else {
+            ui.events.wait_timeout_iter(16).collect()
+        };
         for event in pending_events {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -580,7 +766,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         // Consume the pending IG, then execute its script branch.
                         vm.step()?;
                         vm.set_selected(None);
-                        run_until_input_or_story(
+                        let story_transition = run_until_input_or_story(
                             &mut vm,
                             &mut graphics,
                             &data_dir,
@@ -588,19 +774,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                             Some(&mut ui),
                             index != 0,
                         )?;
-                        if ui.quit_requested {
-                            break 'running;
-                        }
-                        println!("Menu choice {index}: VM position {:?}", vm.position());
+                        let mut frame = graphics.screen().clone();
                         if let Some(page) = vm.text_page() {
                             let renderer = TextRenderer::new()?;
-                            let frame = renderer.draw_page(graphics.screen(), page);
-                            background = texture_from_rgba(&creator, &frame)?;
+                            let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                            frame = renderer.draw_page(
+                                graphics.screen(),
+                                page.speaker.as_deref(),
+                                &page.body,
+                                &layout,
+                            );
                             text_renderer = Some(renderer);
                             ui.canvas
                                 .window_mut()
                                 .set_title("家族計画 ～追憶～ | Click for next line")?;
                             preview = true;
+                        }
+                        if ui.quit_requested {
+                            break 'running;
+                        }
+                        println!("Menu choice {index}: VM position {:?}", vm.position());
+                        if let Some(story_transition) = story_transition {
+                            next_transition = Some(PendingTransition {
+                                transition: story_transition,
+                                final_frame: frame,
+                            });
+                        } else {
+                            background = texture_from_rgba(&creator, &frame)?;
                         }
                     }
                 }
@@ -610,7 +810,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } if preview => {
                     vm.clear_text_page();
                     vm.click();
-                    run_until_input_or_story(
+                    let story_transition = run_until_input_or_story(
                         &mut vm,
                         &mut graphics,
                         &data_dir,
@@ -621,21 +821,108 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if ui.quit_requested {
                         break 'running;
                     }
+                    let mut frame = graphics.screen().clone();
                     if let (Some(page), Some(renderer)) = (vm.text_page(), &text_renderer) {
-                        let frame = renderer.draw_page(graphics.screen(), page);
-                        background = texture_from_rgba(&creator, &frame)?;
+                        let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                        frame =
+                            renderer.draw_page(graphics.screen(), page.speaker.as_deref(), &page.body, &layout);
                     } else {
-                        background = texture_from_rgba(&creator, graphics.screen())?;
                         ui.canvas
                             .window_mut()
                             .set_title("Script paused | Esc to quit")?;
+                    }
+                    if let Some(story_transition) = story_transition {
+                        next_transition = Some(PendingTransition {
+                            transition: story_transition,
+                            final_frame: frame,
+                        });
+                    } else {
+                        background = texture_from_rgba(&creator, &frame)?;
                     }
                 }
                 _ => {}
             }
         }
+        if let Some(pending) = &mut next_transition {
+            let finished = pending.transition.advance(Duration::from_millis(16));
+            let frame = if finished {
+                pending.final_frame.clone()
+            } else {
+                pending.transition.frame()
+            };
+            background = texture_from_rgba(&creator, &frame)?;
+            if finished {
+                graphics.set_screen(pending.final_frame.clone());
+                next_transition = None;
+            }
+        }
         draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
-        std::thread::sleep(Duration::from_millis(16));
+        if next_transition.is_none() {
+            std::thread::sleep(Duration::from_millis(4));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::BlitOp;
+
+    fn image(color: [u8; 4]) -> RgbaImage {
+        RgbaImage::from_pixel(2, 2, image::Rgba(color))
+    }
+
+    #[test]
+    fn blend_frames_interpolates_between_the_captured_states() {
+        let from = image([0, 0, 0, 255]);
+        let to = image([200, 100, 50, 255]);
+        assert_eq!(blend_frames(&from, &to, 0.0).get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(
+            blend_frames(&from, &to, 1.0).get_pixel(0, 0).0,
+            [200, 100, 50, 255]
+        );
+        assert_eq!(
+            blend_frames(&from, &to, 0.5).get_pixel(0, 0).0,
+            [100, 50, 25, 255]
+        );
+    }
+
+    #[test]
+    fn transition_progress_runs_from_zero_to_complete() {
+        let mut transition = Transition::new(image([0, 0, 0, 255]), image([255, 255, 255, 255]), 100);
+        assert_eq!(transition.progress(), 0.0);
+        assert!(!transition.advance(Duration::from_millis(50)));
+        assert!((transition.progress() - 0.5).abs() < 0.01);
+        assert!(transition.advance(Duration::from_millis(50)));
+        assert_eq!(transition.progress(), 1.0);
+    }
+
+    #[test]
+    fn zero_duration_transition_is_already_complete() {
+        let transition = Transition::new(image([0, 0, 0, 255]), image([1, 2, 3, 255]), 0);
+        assert_eq!(transition.progress(), 1.0);
+        assert_eq!(transition.frame().get_pixel(0, 0).0, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn gp_transition_commands_expose_their_duration() {
+        let mut op = BlitOp {
+            command: 7,
+            source: 1,
+            source_x: 0,
+            source_y: 0,
+            width: 1,
+            height: 1,
+            destination: 1500,
+            destination_x: 0,
+            destination_y: 0,
+        };
+        assert_eq!(op.duration(), 1500);
+        op.command = 1;
+        assert_eq!(op.duration(), 0);
+        op.command = 19;
+        op.destination = -5;
+        assert_eq!(op.duration(), 0);
+    }
 }

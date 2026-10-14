@@ -11,6 +11,7 @@ struct Surface {
 pub struct Graphics {
     root: PathBuf,
     surfaces: HashMap<i32, Surface>,
+    names: HashMap<String, i32>,
 }
 
 impl Graphics {
@@ -23,7 +24,20 @@ impl Graphics {
                 has_alpha: false,
             },
         );
-        Self { root, surfaces }
+        Self {
+            root,
+            surfaces,
+            names: HashMap::new(),
+        }
+    }
+
+    /// Slot holding the most recently loaded graphic with this script name.
+    pub fn slot_of(&self, name: &str) -> Option<i32> {
+        self.names.get(&name.to_ascii_uppercase()).copied()
+    }
+
+    pub fn surface(&self, slot: i32) -> Option<&RgbaImage> {
+        self.surfaces.get(&slot).map(|surface| &surface.pixels)
     }
 
     pub fn allocate(&mut self, slot: i32, width: i32, height: i32) -> Result<(), String> {
@@ -64,6 +78,7 @@ impl Graphics {
         let has_alpha = image.color().has_alpha();
         let pixels = DynamicImage::to_rgba8(&image);
         let dimensions = pixels.dimensions();
+        self.names.insert(name.to_ascii_uppercase(), slot);
         self.surfaces.insert(slot, Surface { pixels, has_alpha });
         Ok(dimensions)
     }
@@ -85,6 +100,14 @@ impl Graphics {
 
     pub fn screen(&self) -> &RgbaImage {
         &self.surfaces.get(&0).expect("screen surface exists").pixels
+    }
+
+    /// Replace the screen contents with a composed frame.
+    pub fn set_screen(&mut self, pixels: RgbaImage) {
+        self.surfaces
+            .get_mut(&0)
+            .expect("screen surface exists")
+            .pixels = pixels;
     }
 
     pub fn show_surface(&mut self, slot: i32) -> Result<(), String> {

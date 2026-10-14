@@ -21,15 +21,16 @@ FFmpeg decodes the movie; SDL displays its frames and plays its audio inside
 the same game window. Escape during the movie skips directly to title loading.
 The visible title is rendered from the VM's screen surface. Start now runs
 through the first scene background and `PM` text pages. Japanese text is
-decoded from Shift-JIS, drawn with a system font, and advanced by mouse
-click. Music requests resolve to the extracted OGG files: `ML` starts
-looping playback through SDL_mixer, `MS` stops it, and `SER` plays sound
-effects. `MP` retains the reference engine's no-op behavior. `GO` and fade
-variants of `GP` apply the final image immediately; timed animation is
-pending. The story renderer currently uses a simple dark text panel rather
-than the original window graphic. Voice playback and other later script
-instructions are still pending. Continue and Extras may stop at an unsupported
-opcode. Exit closes the window.
+decoded from Shift-JIS and composed into the original message-box graphic
+(`KA_M.GG2`) at the window origin from `START`'s setup; the speaker line from a
+`PM` speaker command uses the `SETFONTCOLOR` name palette, and pages advance on
+mouse click. Timed `GO` fades and `GP` transition commands cross-fade over
+their scripted duration instead of landing instantly. Music requests resolve to
+the extracted OGG files: `ML` starts looping playback through SDL_mixer, `MS`
+stops it, and `SER` plays sound effects. Recorded voice plays from the bank
+selected by `CNF` (`VOICE1`/`VOICE2`), and `MP` retains the reference engine's
+no-op behavior. Later script instructions are still pending; Continue and
+Extras may stop at an unsupported opcode. Exit closes the window.
 
 ## Run
 
@@ -66,11 +67,20 @@ cargo run -- /Users/a1/Desktop/dev/ikura/game_data data/scripts.json --probe-sto
 Both probes skip video playback. For a normal GUI run,
 `IKURA_SKIP_VIDEO=1` also skips the movie. `IKURA_DUMP_TITLE=/tmp/title.png` saves the title
 surface during the probe. `IKURA_DUMP_STORY=/tmp/story.png` saves the first
-rendered story page during `--probe-story`. `IKURA_FONT` overrides the font
+composed story page during `--probe-story`; `IKURA_PROBE_PAGES` and
+`IKURA_PROBE_CHOICE` control how far the headless story walk goes and which
+choice it takes. `IKURA_FONT` overrides the font
 file for Japanese text. `IKURA_TRACE_VM=1` prints each instruction position.
+
+To compose a single page with a speaker header without walking the script:
+
+```sh
+cargo run --example story_probe -- /Users/a1/Desktop/dev/ikura/game_data /tmp/page.png
+```
 
 ## Next work
 
-Add voice playback, the original text-window graphic, and timed `GO`/`GP`
-transitions. The Python parser remains the
-source of bytecode decoding; the Rust VM handles instruction behavior.
+The Python parser remains the source of bytecode decoding; the Rust VM handles
+instruction behavior. Remaining engine work: the menu/choice window graphics,
+save and load UI (`F5`/`F7` already capture their settings), the unsupported
+opcodes listed by `Step::Unsupported`, and window-graphic animation frames.

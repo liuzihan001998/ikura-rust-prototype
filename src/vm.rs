@@ -35,7 +35,24 @@ pub struct ChoiceOption {
     pub caption: String,
 }
 
+/// One decoded `PM` page: an optional speaker name plus the body text.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextPage {
+    pub speaker: Option<String>,
+    pub body: String,
+}
+
+impl TextPage {
+    /// Display form: the speaker on its own line, then the body.
+    pub fn render(&self) -> String {
+        match &self.speaker {
+            Some(speaker) if !speaker.is_empty() => format!("{speaker}\n{}", self.body),
+            _ => self.body.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextWindow {
     pub graphic: Option<String>,
     pub x: i32,
@@ -43,19 +60,6 @@ pub struct TextWindow {
     pub width: i32,
     pub height: i32,
     pub colors: HashMap<u8, [u8; 3]>,
-}
-
-impl Default for TextWindow {
-    fn default() -> Self {
-        Self {
-            graphic: None,
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-            colors: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +73,18 @@ pub struct BlitOp {
     pub destination: i32,
     pub destination_x: i32,
     pub destination_y: i32,
+}
+
+impl BlitOp {
+    /// Transition commands carry their duration in the destination field; all
+    /// other blit commands copy immediately.
+    pub fn duration(&self) -> i32 {
+        if matches!(self.command, 7 | 19) {
+            self.destination.max(0)
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -119,7 +135,7 @@ pub enum Step {
     },
     VoiceStopped,
     GraphicBank(String),
-    TextPage(String),
+    TextPage(TextPage),
     Blit(BlitOp),
     InitSurface {
         slot: i32,
@@ -154,7 +170,7 @@ pub struct Vm {
     delay_ms: u64,
     speaker_names: HashMap<u8, String>,
     text_window: TextWindow,
-    text_page: Option<String>,
+    text_page: Option<TextPage>,
     voice_bank: String,
     choice_options: Vec<ChoiceOption>,
     choice_selected: Option<u8>,
@@ -198,9 +214,10 @@ fn shift_jis_string(data: &[u8]) -> Result<String, String> {
     Ok(decoded.into_owned())
 }
 
-fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<String, String> {
+fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<TextPage, String> {
     let mut position = 1; // window number
     let mut lines = Vec::new();
+    let mut speaker: Option<String> = None;
     while position < data.len() {
         let command = data[position];
         position += 1;
@@ -219,7 +236,7 @@ fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<String, 
                 let index = *data.get(position).ok_or("PM speaker index missing")?;
                 position += 1;
                 if let Some(name) = names.get(&index) {
-                    lines.push(name.clone());
+                    speaker = Some(name.clone());
                 }
             }
             6 => {}
@@ -229,7 +246,7 @@ fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<String, 
                 if kind == 4 {
                     let index = *data.get(position + 1).ok_or("PM speaker id missing")?;
                     if let Some(name) = names.get(&index) {
-                        lines.push(name.clone());
+                        speaker = Some(name.clone());
                     }
                     position += 3;
                 } else if kind > 0x1F {
@@ -257,7 +274,10 @@ fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<String, 
             return Err("PM command exceeds payload".into());
         }
     }
-    Ok(lines.join("\n"))
+    Ok(TextPage {
+        speaker,
+        body: lines.join("\n"),
+    })
 }
 
 impl Vm {
@@ -330,8 +350,12 @@ impl Vm {
         &self.text_window
     }
 
-    pub fn text_page(&self) -> Option<&str> {
-        self.text_page.as_deref()
+    pub fn font_size(&self) -> i32 {
+        self.font_size
+    }
+
+    pub fn text_page(&self) -> Option<&TextPage> {
+        self.text_page.as_ref()
     }
 
     pub fn clear_text_page(&mut self) {
@@ -643,13 +667,13 @@ impl Vm {
                 }
             }
             0x2B => {
-                let text = decode_text_page(&instruction.payload, &self.speaker_names)?;
-                if text.is_empty() {
+                let page = decode_text_page(&instruction.payload, &self.speaker_names)?;
+                if page.body.is_empty() && page.speaker.is_none() {
                     self.text_page = None;
                     return Ok(Step::ControlFlow);
                 }
-                self.text_page = Some(text.clone());
-                return Ok(Step::TextPage(text));
+                self.text_page = Some(page.clone());
+                return Ok(Step::TextPage(page));
             }
             0x01 | 0x02 => {
                 let target = c_string(&instruction.payload, 0)
@@ -1133,13 +1157,54 @@ mod tests {
         let mut vm = Vm::new(scripts, "SNR00").unwrap();
         assert_eq!(
             vm.step().unwrap(),
-            Step::TextPage("どうも騙されたようだ。".into())
+            Step::TextPage(TextPage {
+                speaker: None,
+                body: "どうも騙されたようだ。".into(),
+            })
         );
         assert_eq!(vm.step().unwrap(), Step::InputPoll);
         assert_eq!(vm.position(), Some(("SNR00", 1)));
         vm.click();
         assert_eq!(vm.step().unwrap(), Step::ControlFlow);
         assert_eq!(vm.variables.get(&2), Some(&2));
+    }
+
+    #[test]
+    fn pm_speaker_command_becomes_the_page_header() {
+        let (encoded_name, _, _) = SHIFT_JIS.encode("司");
+        let mut name_payload = vec![0, 1];
+        name_payload.extend_from_slice(&encoded_name);
+        name_payload.push(0);
+        let (encoded_body, _, _) = SHIFT_JIS.encode("生きてるか？");
+        let mut page_payload = vec![0, 4, 1, 0xFF];
+        page_payload.extend_from_slice(&encoded_body);
+        page_payload.push(0);
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "SNR00".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x25, &name_payload),
+                    op(1, 0x2B, &page_payload),
+                    op(2, 0x85, &[1, 0, 2, 0, 1, 1]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "SNR00").unwrap();
+        vm.step().unwrap();
+        assert_eq!(
+            vm.step().unwrap(),
+            Step::TextPage(TextPage {
+                speaker: Some("司".into()),
+                body: "生きてるか？".into(),
+            })
+        );
+        let page = vm.text_page().unwrap();
+        assert_eq!(page.speaker.as_deref(), Some("司"));
+        assert_eq!(page.body, "生きてるか？");
+        assert_eq!(page.render(), "司\n生きてるか？");
     }
 
     #[test]
