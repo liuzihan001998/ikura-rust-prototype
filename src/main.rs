@@ -1204,6 +1204,47 @@ mod tests {
         );
     }
 
+    /// The post-choice animation loop at SNR00:0x4590F compares the engine
+    /// frame counter (read as register 0x1F) with a snapshot. Giving it frames
+    /// must break the cycle.
+    #[test]
+    fn animation_loop_exits_when_frames_are_pumped() {
+        let path = Path::new("data/scripts.json");
+        if !path.is_file() {
+            return;
+        }
+        let scripts: Scripts = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut vm = Vm::new(scripts, "SNR00").unwrap();
+        vm.set_position(0x4590F).unwrap();
+        let mut graphics = Graphics::new(PathBuf::new(), WIDTH, HEIGHT);
+        let mut stalls = 0;
+        for _ in 0..(CYCLE_LIMIT + 8) {
+            // The fragment normally runs as a subroutine; reaching its `RET`
+            // with an empty stack is the expected way out of the guard.
+            let outcome = match run_until_input_or_story(
+                &mut vm,
+                &mut graphics,
+                Path::new("."),
+                false,
+                None,
+                false,
+            ) {
+                Ok((_, outcome)) => outcome,
+                Err(_) => break,
+            };
+            if outcome == RunOutcome::Reached {
+                break;
+            }
+            stalls += 1;
+            vm.tick_frame();
+        }
+        assert!(
+            vm.position().is_some_and(|(_, offset)| offset != 0x4590F),
+            "the animation loop should leave its guard after {stalls} frame ticks, at {:?}",
+            vm.position()
+        );
+    }
+
     #[test]
     fn gp_transition_commands_expose_their_duration() {
         let mut op = BlitOp {
