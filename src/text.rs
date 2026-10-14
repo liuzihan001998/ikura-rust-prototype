@@ -338,6 +338,30 @@ impl TextRenderer {
 }
 
 #[cfg(test)]
+mod font_probe {
+    use super::*;
+
+    /// Prints per-glyph rasterisation stats for the rare characters in the
+    /// script, to tell a missing glyph apart from a rendering bug.
+    #[test]
+    #[ignore = "diagnostic only"]
+    fn report_glyph_coverage() {
+        let renderer = TextRenderer::new().expect("font");
+        for ch in ['騙', '謎', '追', '憶', '司', '。', '、', '「'] {
+            let (metrics, bitmap) = renderer.font.rasterize(ch, 22.0);
+            let filled = bitmap.iter().filter(|&&value| value > 0).count();
+            println!(
+                "{ch}: advance={:.1} w={} h={} filled={}",
+                metrics.advance_width,
+                metrics.width,
+                metrics.height,
+                filled
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -414,6 +438,58 @@ mod tests {
             .filter(|&(x, y)| frame.get_pixel(x as u32, y as u32).0 != [0, 0, 0, 255])
             .count();
         assert_eq!(rows_below, 0, "text leaked outside the window box");
+    }
+
+    /// The message box graphic is translucent, so composed text must never be
+    /// baked back into the scene: the next page would then draw its own text
+    /// over the previous page's and show through as ghosting.
+    #[test]
+    fn composing_a_page_never_mutates_the_scene() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let scene = RgbaImage::from_pixel(640, 480, Rgba([30, 40, 50, 255]));
+        let graphic = RgbaImage::from_pixel(480, 120, Rgba([60, 60, 60, 180]));
+        let mut layout = layout(Some(graphic), 120);
+        layout.x = 40;
+        layout.y = 340;
+        layout.width = 480;
+        let page_one = renderer.draw_page(&scene, None, "一つ目の文章です。", &layout);
+        let page_two = renderer.draw_page(&scene, None, "二つ目の文章です。", &layout);
+        // The scene stays scene-only, so each page composites onto clean pixels.
+        assert_eq!(
+            scene.get_pixel(300, 400).0,
+            [30, 40, 50, 255],
+            "page composition must not write into the scene surface"
+        );
+        // Each page keeps its own glyphs.
+        assert!(renderer_has_text(&page_one, &scene, 40, 340, 480, 120));
+        assert!(renderer_has_text(&page_two, &scene, 40, 340, 480, 120));
+        assert_ne!(
+            page_one.as_raw(),
+            page_two.as_raw(),
+            "the two pages must not render identically"
+        );
+    }
+
+    /// True when some pixel inside `area` differs from the graphic fill, which
+    /// only happens where glyphs were drawn.
+    fn renderer_has_text(
+        frame: &RgbaImage,
+        scene: &RgbaImage,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let graphic = [60u8, 60, 60];
+        let scene_only = scene.get_pixel(0, 0).0;
+        (y..y + height).any(|py| {
+            (x..x + width).any(|px| {
+                let pixel = frame.get_pixel(px as u32, py as u32).0;
+                pixel[..3] != graphic && pixel != scene_only
+            })
+        })
     }
 
     #[test]

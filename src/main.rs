@@ -39,10 +39,15 @@ struct VideoUi {
 impl VideoUi {
     fn new() -> Result<Self, Box<dyn Error>> {
         let sdl = sdl2::init()?;
+        // The game's own name belongs in the application name, which macOS
+        // shows in the menu bar. The window title stays ASCII: SDL's Cocoa
+        // backend mangles non-ASCII titles into overlapping mojibake on this
+        // platform, which made the title bar unreadable.
+        let _ = sdl2::hint::set("SDL_APP_NAME", "家族計画 ～追憶～");
         let video = sdl.video()?;
         let audio = sdl.audio()?;
         let window = video
-            .window("家族計画 ～追憶～ | Rust title prototype", WIDTH, HEIGHT)
+            .window("Kazoku Keikaku - Rust prototype", WIDTH, HEIGHT)
             .position_centered()
             .resizable()
             .build()?;
@@ -1016,7 +1021,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             text_renderer = Some(renderer);
                             ui.canvas
                                 .window_mut()
-                                .set_title("家族計画 ～追憶～ | Click for next line")?;
+                                .set_title("Kazoku Keikaku - click for next line")?;
                             preview = true;
                         }
                         if ui.quit_requested {
@@ -1100,7 +1105,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             background = texture_from_rgba(&creator, &frame)?;
             if finished {
-                graphics.set_screen(pending.final_frame.clone());
+                // Keep the VM surface free of composed text: the box graphic is
+                // translucent, so text baked in here would show through the
+                // next page's box as ghosting.
                 next_transition = None;
             }
         }

@@ -19,12 +19,16 @@ full startup path matches the previous partial boot byte for byte.
 
 FFmpeg decodes the movie; SDL displays its frames and plays its audio inside
 the same game window. Escape during the movie skips directly to title loading.
-The visible title is rendered from the VM's screen surface. Start now runs
+The window title stays ASCII because SDL's macOS backend mangles non-ASCII
+titles; the game's own name is set as the application name instead. The visible
+title is rendered from the VM's screen surface. Start now runs
 through the first scene background and `PM` text pages. Japanese text is
 decoded from Shift-JIS and composed into the original message-box graphic
 (`KA_M.GG2`) at the window origin from `START`'s setup; the speaker line from a
 `PM` speaker command uses the `SETFONTCOLOR` name palette, and pages advance on
-mouse click. Scripted choices render from their `CSET` rectangles with a
+mouse click. Composed text is never written back into the VM's graphics
+surfaces: the message box is translucent, so baking it in made the next page
+draw over the previous page's text and show through as ghosting. Scripted choices render from their `CSET` rectangles with a
 hover highlight and select the branch with a click. Timed `GO` fades and `GP` transition commands cross-fade over
 their scripted duration instead of landing instantly. Music requests resolve to
 the extracted OGG files: `ML` starts looping playback through SDL_mixer, `MS`

@@ -102,14 +102,6 @@ impl Graphics {
         &self.surfaces.get(&0).expect("screen surface exists").pixels
     }
 
-    /// Replace the screen contents with a composed frame.
-    pub fn set_screen(&mut self, pixels: RgbaImage) {
-        self.surfaces
-            .get_mut(&0)
-            .expect("screen surface exists")
-            .pixels = pixels;
-    }
-
     pub fn show_surface(&mut self, slot: i32) -> Result<(), String> {
         let source = self
             .surfaces
