@@ -307,6 +307,15 @@ impl Transition {
     }
 }
 
+/// Why the runner stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// The script reached an input poll, story boundary, or its end.
+    Reached,
+    /// The step budget ran out while the script was waiting for external state.
+    Stalled,
+}
+
 /// A running transition plus the composed frame to show once it lands.
 struct PendingTransition {
     transition: Transition,
@@ -402,6 +411,11 @@ fn load_window_graphic(graphics: &Graphics, data_dir: &Path, name: &str) -> Opti
     Some(image.to_rgba8())
 }
 
+/// Instructions the runner may execute before it hands control back to the
+/// event loop. A script that spins on state only the window can change (input,
+/// frame timers) is reported as stalled instead of failing.
+const STEP_BUDGET: usize = 10_000;
+
 #[allow(clippy::too_many_arguments)]
 fn run_until_input_or_story(
     vm: &mut Vm,
@@ -410,13 +424,13 @@ fn run_until_input_or_story(
     play_movies: bool,
     mut ui: Option<&mut VideoUi>,
     stop_at_story: bool,
-) -> Result<Option<Transition>, Box<dyn Error>> {
+) -> Result<(Option<Transition>, RunOutcome), Box<dyn Error>> {
     let mut page_seen = false;
     let mut transition = None;
-    for _ in 0..10000 {
+    for _ in 0..STEP_BUDGET {
         let (script, offset) = vm.position().ok_or("VM finished unexpectedly")?;
         if (stop_at_story && script == "SNR00") || (script == "TITLE" && offset == 0x7B9) {
-            return Ok(transition);
+            return Ok((transition, RunOutcome::Reached));
         }
         let position = format!("{script}:0x{offset:X}");
         if std::env::var_os("IKURA_TRACE_VM").is_some() {
@@ -527,17 +541,16 @@ fn run_until_input_or_story(
                     None => println!("VM {position}: PM text: {}", page.body),
                 }
                 if page_seen {
-                    return Ok(transition);
+                    return Ok((transition, RunOutcome::Reached));
                 }
                 page_seen = true;
             }
-            Step::InputPoll => return Ok(transition),
-            Step::ChoicePoll => return Ok(transition),
+            Step::InputPoll | Step::ChoicePoll => return Ok((transition, RunOutcome::Reached)),
             Step::Blit(operation) => {
                 let before = graphics.screen().clone();
                 if let Err(error) = graphics.blit(&operation) {
                     println!("VM paused at {position}: {error}");
-                    return Ok(transition);
+                    return Ok((transition, RunOutcome::Reached));
                 }
                 if transition.is_none() && operation.duration() > 0 {
                     transition = Some(Transition::new(
@@ -567,7 +580,7 @@ fn run_until_input_or_story(
                     let ui = ui.as_deref_mut().ok_or("AVIP needs an SDL window")?;
                     play_video(data_dir, &name, destination_width, destination_height, ui)?;
                     if ui.quit_requested {
-                        return Ok(transition);
+                        return Ok((transition, RunOutcome::Reached));
                     }
                 } else {
                     println!("VM {position}: video skipped");
@@ -575,7 +588,7 @@ fn run_until_input_or_story(
             }
             Step::Unsupported { opcode, .. } => {
                 println!("VM paused at {position}: opcode 0x{opcode:02X} is not implemented yet");
-                return Ok(transition);
+                return Ok((transition, RunOutcome::Reached));
             }
             Step::Yield => vm.advance_clock(16),
             Step::Wait(milliseconds) => {
@@ -584,15 +597,15 @@ fn run_until_input_or_story(
                 }
                 vm.advance_clock(milliseconds);
             }
-            Step::Finished => return Ok(transition),
+            Step::Finished => return Ok((transition, RunOutcome::Reached)),
             Step::ControlFlow => {}
         }
     }
-    Err(format!(
-        "VM exceeded 10000 steps before reaching an input or story boundary; position {:?}",
+    println!(
+        "VM at {:?} is waiting for external state after {STEP_BUDGET} instructions",
         vm.position()
-    )
-    .into())
+    );
+    Ok((transition, RunOutcome::Stalled))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -638,7 +651,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     // Begin at START's real code_start. The VM executes initialization,
     // video playback, and title loading without jumping over setup code.
-    let mut transition = run_until_input_or_story(
+    let (mut transition, _) = run_until_input_or_story(
         &mut vm,
         &mut graphics,
         &data_dir,
@@ -664,7 +677,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         vm.set_selected(Some(0));
         vm.step()?;
         vm.set_selected(None);
-        run_until_input_or_story(&mut vm, &mut graphics, &data_dir, false, None, !probe_story)?;
+        let (_, outcome) = run_until_input_or_story(
+            &mut vm,
+            &mut graphics,
+            &data_dir,
+            false,
+            None,
+            !probe_story,
+        )?;
+        if outcome == RunOutcome::Stalled {
+            println!("Story probe stalled before the first page");
+            return Ok(());
+        }
         println!("VM after Start: {:?}", vm.position());
         if probe_story {
             let page = vm
@@ -701,7 +725,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     vm.clear_text_page();
                     vm.click();
                 }
-                run_until_input_or_story(&mut vm, &mut graphics, &data_dir, false, None, false)?;
+                let (_, outcome) = run_until_input_or_story(
+                    &mut vm,
+                    &mut graphics,
+                    &data_dir,
+                    false,
+                    None,
+                    false,
+                )?;
+                if outcome == RunOutcome::Stalled && vm.text_page().is_none() {
+                    println!("Story probe stalled at {:?}", vm.position());
+                    break;
+                }
                 if vm.waiting_for_choice() {
                     continue;
                 } else if let Some(page) = vm.text_page() {
@@ -724,6 +759,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut preview = false;
     let mut text_renderer = None;
     let mut story_frame = StoryFrame::new();
+    // A stalled script keeps its state, so further clicks can still advance it.
+    let mut stalled = false;
     let mut next_transition = transition
         .take()
         .map(|transition| PendingTransition {
@@ -766,7 +803,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         // Consume the pending IG, then execute its script branch.
                         vm.step()?;
                         vm.set_selected(None);
-                        let story_transition = run_until_input_or_story(
+                        let (story_transition, _) = run_until_input_or_story(
                             &mut vm,
                             &mut graphics,
                             &data_dir,
@@ -807,10 +844,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Event::MouseButtonDown {
                     mouse_btn: MouseButton::Left,
                     ..
-                } if preview => {
+                } if preview && !stalled => {
                     vm.clear_text_page();
                     vm.click();
-                    let story_transition = run_until_input_or_story(
+                    let (story_transition, outcome) = run_until_input_or_story(
                         &mut vm,
                         &mut graphics,
                         &data_dir,
@@ -818,6 +855,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Some(&mut ui),
                         false,
                     )?;
+                    if outcome == RunOutcome::Stalled {
+                        stalled = true;
+                    }
                     if ui.quit_requested {
                         break 'running;
                     }
@@ -826,6 +866,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let layout = story_frame.layout(&graphics, &data_dir, &vm);
                         frame =
                             renderer.draw_page(graphics.screen(), page.speaker.as_deref(), &page.body, &layout);
+                    } else if stalled {
+                        ui.canvas
+                            .window_mut()
+                            .set_title("Script awaiting input | Esc to quit")?;
                     } else {
                         ui.canvas
                             .window_mut()
@@ -903,6 +947,46 @@ mod tests {
         let transition = Transition::new(image([0, 0, 0, 255]), image([1, 2, 3, 255]), 0);
         assert_eq!(transition.progress(), 1.0);
         assert_eq!(transition.frame().get_pixel(0, 0).0, [1, 2, 3, 255]);
+    }
+
+    fn empty_scripts() -> Scripts {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "LOOP".into(),
+            vm::Script {
+                code_start: 0,
+                jumps: vec![10, 0],
+                instructions: vec![
+                    Instruction {
+                        offset: 0,
+                        opcode: 0x04,
+                        payload: vec![1, 0],
+                    },
+                    Instruction {
+                        offset: 10,
+                        opcode: 0x04,
+                        payload: vec![0, 0],
+                    },
+                ],
+            },
+        );
+        scripts
+    }
+
+    #[test]
+    fn runner_reports_a_stalled_script_instead_of_failing() {
+        let mut vm = Vm::new(empty_scripts(), "LOOP").unwrap();
+        let mut graphics = Graphics::new(PathBuf::new(), WIDTH, HEIGHT);
+        let (transition, outcome) =
+            run_until_input_or_story(&mut vm, &mut graphics, Path::new("."), false, None, false)
+                .unwrap();
+        assert_eq!(outcome, RunOutcome::Stalled);
+        assert!(transition.is_none());
+        assert!(
+            matches!(vm.position(), Some(("LOOP", 0)) | Some(("LOOP", 10))),
+            "the stalled position must be preserved: {:?}",
+            vm.position()
+        );
     }
 
     #[test]

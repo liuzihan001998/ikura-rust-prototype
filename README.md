@@ -72,6 +72,11 @@ composed story page during `--probe-story`; `IKURA_PROBE_PAGES` and
 choice it takes. `IKURA_FONT` overrides the font
 file for Japanese text. `IKURA_TRACE_VM=1` prints each instruction position.
 
+A long walk stops when the script waits on state the VM cannot produce on its
+own (a frame counter or a timer owned by the window). That is reported as
+`Story probe stalled at ...` with the exact position, and the GUI shows
+`Script awaiting input` instead of dropping the script.
+
 To compose a single page with a speaker header without walking the script:
 
 ```sh
