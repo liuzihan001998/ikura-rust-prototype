@@ -22,6 +22,10 @@ fn main() {
         width: 0,
         height: 0,
         font_size: 20,
+        font_style: std::env::var("IKURA_PROBE_FONT_STYLE")
+            .ok()
+            .map(|value| value.parse().expect("font style byte"))
+            .unwrap_or(5),
         frame: Some(graphic),
         colors: HashMap::from([(0, [255, 255, 255]), (1, [8, 12, 72])]),
     };

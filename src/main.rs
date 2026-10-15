@@ -1,5 +1,11 @@
+mod assets;
+mod cursor;
+mod effects;
 mod graphics;
+mod history;
 mod save;
+mod save_menu;
+mod settings;
 mod text;
 mod video;
 mod vm;
@@ -20,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use text::{TextRenderer, TextWindowLayout};
 use video::Playback;
-use vm::{Instruction, Scripts, Step, Vm};
+use vm::{Instruction, Scripts, Step, TranslationPack, Vm};
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
@@ -67,6 +73,77 @@ fn dialogue_chars(vm: &Vm) -> usize {
         .map_or(0, |page| page.body.chars().filter(|&ch| ch != '\n').count())
 }
 
+fn record_history_page(history: &mut Vec<history::Entry>, vm: &Vm, ui: &mut VideoUi, root: &Path) {
+    if let Some(page) = vm.text_page() {
+        let voices = std::mem::take(&mut ui.page_voices)
+            .into_iter()
+            .filter_map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
+            .filter(|path| history::safe_voice(path))
+            .collect();
+        history.push(history::Entry {
+            page: page.clone(),
+            voices,
+        });
+        if history.len() > history::LIMIT {
+            history.drain(..history.len() - history::LIMIT);
+        }
+    } else {
+        ui.page_voices.clear();
+    }
+}
+
+fn checkpoint_due(
+    previous: Option<&(String, usize)>,
+    current: Option<&(String, usize)>,
+    choosing: bool,
+    elapsed: Duration,
+) -> bool {
+    current.is_some()
+        && previous != current
+        && (previous.is_none()
+            || choosing
+            || elapsed >= Duration::from_secs(30)
+            || previous.zip(current).is_some_and(|(a, b)| a.0 != b.0))
+}
+
+fn is_title_input(vm: &Vm) -> bool {
+    vm.position() == Some(("TITLE", 0x7B9))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitInput {
+    Quit,
+    Skip,
+    Defer,
+    Ignore,
+}
+
+fn wait_input(event: &Event) -> WaitInput {
+    match event {
+        Event::Quit { .. }
+        | Event::KeyDown {
+            keycode: Some(Keycode::Escape),
+            ..
+        } => WaitInput::Quit,
+        Event::MouseButtonDown {
+            mouse_btn: MouseButton::Left,
+            ..
+        }
+        | Event::KeyDown {
+            keycode: Some(Keycode::Space | Keycode::Return),
+            repeat: false,
+            ..
+        } => WaitInput::Skip,
+        Event::KeyDown { repeat: false, .. }
+        | Event::MouseMotion { .. }
+        | Event::MouseButtonDown {
+            mouse_btn: MouseButton::Right,
+            ..
+        } => WaitInput::Defer,
+        _ => WaitInput::Ignore,
+    }
+}
+
 struct VideoUi {
     _sdl: sdl2::Sdl,
     canvas: Canvas<Window>,
@@ -79,10 +156,24 @@ struct VideoUi {
     music_path: Option<PathBuf>,
     voice_path: Option<PathBuf>,
     quit_requested: bool,
+    cursors: cursor::GameCursors,
+    masks: effects::EffectMasks,
+    deferred_events: Vec<Event>,
+    mouse_range: Option<Option<vm::MouseRange>>,
+    settings: settings::Settings,
+    music_started: Option<std::time::Instant>,
+    voice_started: Option<std::time::Instant>,
+    music_offset_ms: u64,
+    music_duration_ms: Option<u64>,
+    voice_offset_ms: u64,
+    page_voices: Vec<PathBuf>,
+    replay_voice: Option<Chunk>,
+    replay_queue: std::collections::VecDeque<PathBuf>,
+    modal_voice_paused: Option<std::time::Instant>,
 }
 
 impl VideoUi {
-    fn new() -> Result<Self, Box<dyn Error>> {
+    fn new(data_dir: &Path) -> Result<Self, Box<dyn Error>> {
         let sdl = sdl2::init()?;
         // The game's own name belongs in the application name, which macOS
         // shows in the menu bar. The window title stays ASCII: SDL's Cocoa
@@ -102,6 +193,8 @@ impl VideoUi {
         canvas.clear();
         canvas.present();
         let events = sdl.event_pump()?;
+        let cursors = cursor::GameCursors::new(data_dir)?;
+        let masks = effects::EffectMasks::new(data_dir)?;
         Ok(Self {
             _sdl: sdl,
             canvas,
@@ -114,9 +207,205 @@ impl VideoUi {
             music_path: None,
             voice_path: None,
             quit_requested: false,
+            cursors,
+            masks,
+            deferred_events: Vec::new(),
+            mouse_range: None,
+            settings: settings::Settings::default(),
+            music_started: None,
+            voice_started: None,
+            music_offset_ms: 0,
+            music_duration_ms: None,
+            voice_offset_ms: 0,
+            page_voices: Vec::new(),
+            replay_voice: None,
+            replay_queue: Default::default(),
+            modal_voice_paused: None,
         })
     }
 
+    fn sync_cursor(&mut self, vm: &Vm, override_id: Option<u8>) -> Result<(), String> {
+        let id = override_id.unwrap_or(vm.cursor_style());
+        self.cursors.update(id, vm.cursor_resource(id))?;
+        let range = vm.mouse_range();
+        if self.mouse_range != Some(range) {
+            let bounds = range.map(|range| scale_mouse_range(range, self.canvas.window().size()));
+            self.canvas
+                .window()
+                .set_mouse_rect(bounds)
+                .map_err(|error| format!("IMS could not set mouse range: {error}"))?;
+            self.mouse_range = Some(range);
+        }
+        Ok(())
+    }
+
+    fn warp_mouse(&self, x: i32, y: i32) {
+        let (window_width, window_height) = self.canvas.window().size();
+        let x = x.clamp(0, WIDTH as i32 - 1) * window_width as i32 / WIDTH as i32;
+        let y = y.clamp(0, HEIGHT as i32 - 1) * window_height as i32 / HEIGHT as i32;
+        self._sdl
+            .mouse()
+            .warp_mouse_in_window(self.canvas.window(), x, y);
+    }
+
+    fn wait_script(&mut self, vm: &Vm, milliseconds: u64) -> Result<bool, String> {
+        if milliseconds == 0 {
+            return Ok(!self.quit_requested);
+        }
+        let started = std::time::Instant::now();
+        let duration = Duration::from_millis(milliseconds);
+        loop {
+            let mut skip = false;
+            for event in self.events.poll_iter().collect::<Vec<_>>() {
+                match wait_input(&event) {
+                    WaitInput::Quit => self.quit_requested = true,
+                    WaitInput::Skip => skip = true,
+                    WaitInput::Defer => {
+                        // Keep the last mouse position and bounded command
+                        // input for the outer UI, without replaying skip clicks.
+                        if matches!(event, Event::MouseMotion { .. }) {
+                            self.deferred_events
+                                .retain(|event| !matches!(event, Event::MouseMotion { .. }));
+                        }
+                        if self.deferred_events.len() < 128 {
+                            self.deferred_events.push(event);
+                        }
+                    }
+                    WaitInput::Ignore => {}
+                }
+            }
+            if self.quit_requested {
+                return Ok(false);
+            }
+            self.sync_cursor(vm, None)?;
+            if skip || self.skip_held() || started.elapsed() >= duration {
+                return Ok(true);
+            }
+            std::thread::sleep(
+                duration
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(8)),
+            );
+        }
+    }
+
+    fn apply_volumes(&self) {
+        if self.mixer_context.is_some() {
+            Music::set_volume(i32::from(self.settings.music) * 128 / 100);
+            Channel(1).set_volume(i32::from(self.settings.sound) * 128 / 100);
+            for channel in [0, 2] {
+                Channel(channel).set_volume(i32::from(self.settings.voice) * 128 / 100);
+            }
+        }
+    }
+    fn apply_settings(&mut self) -> Result<(), String> {
+        self.apply_volumes();
+        let desired = if self.settings.fullscreen {
+            sdl2::video::FullscreenType::Desktop
+        } else {
+            sdl2::video::FullscreenType::Off
+        };
+        if self.canvas.window().fullscreen_state() != desired {
+            self.canvas.window_mut().set_fullscreen(desired)?;
+        }
+        Ok(())
+    }
+    fn audio_state(&self) -> save::AudioState {
+        save::AudioState {
+            music: if self.mixer_context.is_some() && Music::is_playing() {
+                self.music_path.clone()
+            } else {
+                None
+            },
+            voice: if self.voice_playing() {
+                self.voice_path.clone()
+            } else {
+                None
+            },
+            music_position_ms: {
+                let elapsed = self.music_offset_ms
+                    + self
+                        .music_started
+                        .map_or(0, |t| t.elapsed().as_millis() as u64);
+                self.music_duration_ms
+                    .filter(|duration| *duration > 0)
+                    .map_or(elapsed, |duration| elapsed % duration)
+            },
+            voice_position_ms: self.voice_offset_ms
+                + self
+                    .voice_started
+                    .map_or(0, |t| t.elapsed().as_millis() as u64),
+        }
+    }
+    fn pause_dialogue_voice(&mut self) {
+        if self.voice_playing() {
+            Channel(0).pause();
+            self.modal_voice_paused = Some(std::time::Instant::now());
+        }
+    }
+    fn resume_dialogue_voice(&mut self) {
+        if let Some(start) = self.modal_voice_paused.take() {
+            if let Some(voice_start) = &mut self.voice_started {
+                *voice_start += start.elapsed();
+            }
+            Channel(0).resume();
+        }
+    }
+    fn stop_replay(&mut self) {
+        if self.mixer_context.is_some() {
+            Channel(2).halt();
+        }
+        self.replay_voice = None;
+        self.replay_queue.clear();
+    }
+    fn queue_replay(&mut self, paths: Vec<PathBuf>, root: &Path) -> Result<(), Box<dyn Error>> {
+        self.ensure_mixer()?;
+        self.stop_replay();
+        self.replay_queue = paths
+            .into_iter()
+            .filter(|p| history::safe_voice(p))
+            .map(|p| root.join(p))
+            .collect();
+        self.tick_replay()
+    }
+    fn tick_replay(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.mixer_context.is_some() && !Channel(2).is_playing() {
+            self.replay_voice = None;
+            if let Some(path) = self.replay_queue.pop_front() {
+                let chunk = Chunk::from_file(path)?;
+                Channel(2).play(&chunk, 0)?;
+                self.replay_voice = Some(chunk);
+            }
+        }
+        Ok(())
+    }
+    fn restore_voice(&mut self, path: &Path, offset_ms: u64) -> Result<(), Box<dyn Error>> {
+        if offset_ms == 0 {
+            return self.play_voice(path);
+        }
+        self.ensure_mixer()?;
+        self.stop_voice();
+        let output = std::process::Command::new(
+            std::env::var_os("IKURA_FFMPEG").unwrap_or_else(|| "ffmpeg".into()),
+        )
+        .args(["-nostdin", "-v", "error", "-ss"])
+        .arg(format!("{:.3}", offset_ms as f64 / 1000.))
+        .arg("-i")
+        .arg(path)
+        .args(["-vn", "-ac", "2", "-ar", "48000", "-f", "wav", "pipe:1"])
+        .output()?;
+        if !output.status.success() {
+            return Err("could not seek saved voice".into());
+        }
+        use sdl2::mixer::LoaderRWops;
+        let chunk = sdl2::rwops::RWops::from_bytes(&output.stdout)?.load_wav()?;
+        Channel(0).play(&chunk, 0)?;
+        self.voice = Some(chunk);
+        self.voice_path = Some(path.to_path_buf());
+        self.voice_offset_ms = offset_ms;
+        self.voice_started = Some(std::time::Instant::now());
+        Ok(())
+    }
     fn start_music(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
         self.stop_music();
         self.ensure_mixer()?;
@@ -127,6 +416,27 @@ impl VideoUi {
         }
         self.music = Some(music);
         self.music_path = Some(path.to_path_buf());
+        self.music_started = Some(std::time::Instant::now());
+        self.music_offset_ms = 0;
+        self.music_duration_ms = std::process::Command::new(
+            std::env::var_os("IKURA_FFPROBE").unwrap_or_else(|| "ffprobe".into()),
+        )
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|out| out.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.)
+        .map(|v| (v * 1000.) as u64);
         Ok(())
     }
 
@@ -134,8 +444,9 @@ impl VideoUi {
         if self.mixer_context.is_none() {
             let context = mixer::init(InitFlag::OGG)?;
             mixer::open_audio(48000, AUDIO_S16SYS, 2, 1024)?;
-            mixer::reserve_channels(2);
+            mixer::reserve_channels(3);
             self.mixer_context = Some(context);
+            self.apply_volumes();
         }
         Ok(())
     }
@@ -162,6 +473,8 @@ impl VideoUi {
         self.voice = Some(Chunk::from_file(path)?);
         Channel(0).play(self.voice.as_ref().ok_or("voice load failed")?, 0)?;
         self.voice_path = Some(path.to_path_buf());
+        self.voice_started = Some(std::time::Instant::now());
+        self.voice_offset_ms = 0;
         Ok(())
     }
 
@@ -171,6 +484,8 @@ impl VideoUi {
         }
         self.voice = None;
         self.voice_path = None;
+        self.voice_started = None;
+        self.voice_offset_ms = 0;
     }
 
     fn voice_playing(&self) -> bool {
@@ -188,6 +503,8 @@ impl VideoUi {
         }
         self.music = None;
         self.music_path = None;
+        self.music_started = None;
+        self.music_offset_ms = 0;
     }
 
     fn fade_music(&mut self, duration_ms: i32) -> Result<(), Box<dyn Error>> {
@@ -209,6 +526,7 @@ impl Drop for VideoUi {
     fn drop(&mut self) {
         self.stop_music();
         self.stop_voice();
+        self.stop_replay();
         Channel::all().halt();
         self.sounds.clear();
         if self.mixer_context.is_some() {
@@ -252,7 +570,28 @@ fn texture_from_rgba<'a>(
 }
 
 fn menu_at(vm: &Vm, x: i32, y: i32) -> Option<usize> {
-    (0..4).find(|&index| menu_rect(vm, index).is_some_and(|area| area.contains_point((x, y))))
+    (0..=u8::MAX).find_map(|index| {
+        menu_rect(vm, usize::from(index))
+            .filter(|area| area.contains_point((x, y)))
+            .map(|_| usize::from(index))
+    })
+}
+
+fn scale_mouse_range(range: vm::MouseRange, size: (u32, u32)) -> Rect {
+    let left = range.left.clamp(0, WIDTH as i32) as u32;
+    let top = range.top.clamp(0, HEIGHT as i32) as u32;
+    let right = range.right.clamp(left as i32, WIDTH as i32) as u32;
+    let bottom = range.bottom.clamp(top as i32, HEIGHT as i32) as u32;
+    let x = left * size.0 / WIDTH;
+    let y = top * size.1 / HEIGHT;
+    let right = right * size.0 / WIDTH;
+    let bottom = bottom * size.1 / HEIGHT;
+    Rect::new(
+        x as i32,
+        y as i32,
+        right.saturating_sub(x).max(1),
+        bottom.saturating_sub(y).max(1),
+    )
 }
 
 fn choice_at(vm: &Vm, x: i32, y: i32) -> Option<u8> {
@@ -267,9 +606,18 @@ fn choice_at(vm: &Vm, x: i32, y: i32) -> Option<u8> {
         .map(|option| option.value)
 }
 
+fn keyboard_direction(key: Keycode) -> Option<usize> {
+    match key {
+        Keycode::Up => Some(0),
+        Keycode::Down => Some(1),
+        Keycode::Left => Some(2),
+        Keycode::Right => Some(3),
+        _ => None,
+    }
+}
+
 fn draw(
     canvas: &mut Canvas<Window>,
-    title: &Texture,
     background: &Texture,
     preview: bool,
     hover: Option<usize>,
@@ -277,14 +625,13 @@ fn draw(
 ) -> Result<(), Box<dyn Error>> {
     canvas.set_draw_color(Color::BLACK);
     canvas.clear();
-    canvas.copy(if preview { background } else { title }, None, None)?;
+    canvas.copy(background, None, None)?;
     if !preview && let Some(index) = hover {
         canvas.set_draw_color(Color::RGB(255, 225, 30));
         if let Some(area) = menu_rect(vm, index) {
             canvas.draw_rect(area)?;
         }
     }
-    canvas.present();
     Ok(())
 }
 
@@ -364,9 +711,15 @@ struct Transition {
 
 enum TransitionEffect {
     Fade,
+    Mask {
+        pixels: image::GrayImage,
+        reversed: bool,
+    },
     Blinds {
         vertical: bool,
         stripe: u32,
+        rect: [i32; 4],
+        color: [u8; 3],
     },
     Wipe,
     Shake {
@@ -412,12 +765,58 @@ impl Transition {
         }
         match &self.effect {
             TransitionEffect::Fade => blend_frames(&self.from, &self.to, progress),
-            TransitionEffect::Blinds { vertical, stripe } => {
+            TransitionEffect::Mask { pixels, reversed } => {
                 let mut frame = self.from.clone();
+                let width = frame.width();
+                let height = frame.height();
                 for (x, y, pixel) in frame.enumerate_pixels_mut() {
-                    let axis = if *vertical { x } else { y };
-                    if f64::from(axis % stripe) < f64::from(*stripe) * progress {
+                    // Effect maps are 320x240 and the game is 640x480. Use
+                    // nearest-neighbour scaling so every original mask cell
+                    // retains its threshold, including at non-native sizes.
+                    let mx = (u64::from(x) * u64::from(pixels.width()) / u64::from(width)) as u32;
+                    let my = (u64::from(y) * u64::from(pixels.height()) / u64::from(height)) as u32;
+                    let value = pixels.get_pixel(mx, my)[0];
+                    let threshold = if *reversed { 255 - value } else { value };
+                    if f64::from(threshold) < progress * 256.0 {
                         *pixel = *self.to.get_pixel(x, y);
+                    }
+                }
+                frame
+            }
+            TransitionEffect::Blinds {
+                vertical,
+                stripe,
+                rect,
+                color,
+            } => {
+                let mut frame = self.to.clone();
+                let [rx, ry, rw, rh] = *rect;
+                let span = if *vertical { rw } else { rh }.max(0) as u32;
+                let pitch = (*stripe).max(1).min(span.max(1));
+                let advanced = (f64::from(pitch) * progress).floor() as i32;
+                let color = image::Rgba([color[0], color[1], color[2], 255]);
+                for cell in (0..span).step_by(pitch as usize) {
+                    let start = cell as i32 + advanced;
+                    let end = (cell as i32 + pitch as i32).min(span as i32);
+                    let start = start.min(end);
+                    for axis in start..end {
+                        if *vertical {
+                            for y in ry.max(0)..(ry + rh).min(frame.height() as i32) {
+                                let x = rx + axis;
+                                if x >= 0 && x < frame.width() as i32 {
+                                    frame.put_pixel(x as u32, y as u32, color);
+                                }
+                            }
+                        } else {
+                            let y = ry + axis;
+                            if y >= 0 && y < frame.height() as i32 {
+                                for x in rx.max(0)..(rx + rw).min(frame.width() as i32) {
+                                    if x >= 0 {
+                                        frame.put_pixel(x as u32, y as u32, color);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 frame
@@ -500,6 +899,7 @@ fn play_transition(
     let started = std::time::Instant::now();
     let mut previous = started;
     loop {
+        ui.sync_cursor(vm, None)?;
         for event in ui.events.poll_iter() {
             match event {
                 Event::Quit { .. } => {
@@ -566,11 +966,15 @@ fn demo_animations(data_dir: &Path, ui: &mut VideoUi, vm: &mut Vm) -> Result<(),
         TransitionEffect::Fade,
         TransitionEffect::Blinds {
             vertical: false,
-            stripe: 16,
+            stripe: 32,
+            rect: [0, 0, from.width() as i32, from.height() as i32],
+            color: [0, 0, 0],
         },
         TransitionEffect::Blinds {
             vertical: true,
-            stripe: 16,
+            stripe: 32,
+            rect: [0, 0, from.width() as i32, from.height() as i32],
+            color: [0, 0, 0],
         },
         TransitionEffect::Wipe,
         TransitionEffect::Shake {
@@ -610,6 +1014,63 @@ fn demo_animations(data_dir: &Path, ui: &mut VideoUi, vm: &mut Vm) -> Result<(),
         strip.save(path)?;
     }
     println!("Animation demo completed: fade, horizontal/vertical blinds, wipe, shake, scroll");
+    Ok(())
+}
+
+fn demo_masks(data_dir: &Path, ui: &mut VideoUi, vm: &mut Vm) -> Result<(), Box<dyn Error>> {
+    let root = data_dir.join("PNG-images/GGD");
+    let from = image::open(root.join("BG01AC.GG0.png"))?.to_rgba8();
+    let to = image::open(root.join("BG32AC.GG0.png"))?.to_rgba8();
+    let mut preview = RgbaImage::new(320 * 6, 240 * 7);
+    for (row, name) in [
+        "EFF01.BIN",
+        "EFF03.BIN",
+        "EFF04.BIN",
+        "EFF17.BIN",
+        "SEF03.BIN",
+        "SEF04.BIN",
+        "SEF05.BIN",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pixels = ui
+            .masks
+            .get(name)?
+            .ok_or("mask demo needs the original DATA cabinet")?;
+        for (direction, reversed) in [false, true].into_iter().enumerate() {
+            let mut transition = Transition::new(from.clone(), to.clone(), 500);
+            transition.effect = TransitionEffect::Mask {
+                pixels: pixels.clone(),
+                reversed,
+            };
+            for (column, ms) in [125, 250, 375].into_iter().enumerate() {
+                transition.elapsed = Duration::from_millis(ms);
+                let image = image::imageops::resize(
+                    &transition.frame(),
+                    320,
+                    240,
+                    image::imageops::FilterType::Nearest,
+                );
+                image::imageops::replace(
+                    &mut preview,
+                    &image,
+                    ((direction * 3 + column) * 320) as i64,
+                    (row * 240) as i64,
+                );
+            }
+            transition.elapsed = Duration::ZERO;
+            println!("Mask demo: {name} direction={direction}");
+            play_transition(ui, vm, transition)?;
+            if ui.quit_requested {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("IKURA_DUMP_MASKS") {
+        preview.save(path)?;
+    }
+    println!("Mask demo completed: 7 maps, both directions");
     Ok(())
 }
 
@@ -681,6 +1142,7 @@ impl StoryFrame {
             width: window.width,
             height: window.height,
             font_size: vm.font_size(),
+            font_style: vm.font_style(),
             frame: match &self.template {
                 FrameGraphic::Loaded(image) => Some(image.clone()),
                 FrameGraphic::Missing => None,
@@ -692,7 +1154,19 @@ impl StoryFrame {
 
 fn find_graphic(data_dir: &Path, name: &str) -> Option<PathBuf> {
     let wanted = format!("{}.png", name.to_ascii_lowercase());
-    for bank in ["GGD", "GGD2"] {
+    let translated = format!(
+        "{}.ggd.png",
+        name.split('.').next().unwrap_or(name).to_ascii_lowercase()
+    );
+    let banks: &[&str] = if matches!(
+        std::env::var("IKURA_LANG").as_deref(),
+        Ok("zh") | Ok("zh-CN")
+    ) {
+        &["ggd_sc", "GGD", "GGD2"]
+    } else {
+        &["GGD", "GGD2"]
+    };
+    for bank in banks {
         let dir = data_dir.join("PNG-images").join(bank);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -700,7 +1174,13 @@ fn find_graphic(data_dir: &Path, name: &str) -> Option<PathBuf> {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            if file_name.to_ascii_lowercase() == wanted {
+            if file_name.to_ascii_lowercase()
+                == if *bank == "ggd_sc" {
+                    translated.as_str()
+                } else {
+                    wanted.as_str()
+                }
+            {
                 return Some(entry.path());
             }
         }
@@ -791,11 +1271,15 @@ fn run_until_input_or_story(
                 ui.events.pump_events();
             }
             vm.set_playback_state(ui.skip_held(), ui.voice_playing());
+            ui.sync_cursor(vm, None)?;
         }
         let Some((script, offset)) = vm.position() else {
+            if let Some(ui) = ui.as_deref_mut() {
+                ui.quit_requested = true;
+            }
             return Ok((transition, RunOutcome::Finished));
         };
-        if (stop_at_story && script == "SNR00") || (script == "TITLE" && offset == 0x7B9) {
+        if (stop_at_story && script == "SNR00") || is_title_input(vm) {
             return Ok((transition, RunOutcome::Reached));
         }
         let here = (script.to_owned(), offset);
@@ -851,17 +1335,37 @@ fn run_until_input_or_story(
                     )?;
                 }
             }
-            Step::ShowSurface { slot, duration_ms } => {
+            Step::ShowSurface {
+                slot,
+                duration_ms,
+                effect_kind,
+                direction,
+                parameter,
+                mask,
+            } => {
                 let before = graphics.screen().clone();
                 graphics.show_surface(slot)?;
-                println!("VM {position}: GGE slot={slot} final frame ({duration_ms}ms)");
+                println!(
+                    "VM {position}: GGE slot={slot} mask={mask} direction={direction} parameter={parameter} ({duration_ms}ms)"
+                );
                 if duration_ms > 0 {
-                    dispatch_transition(
-                        &mut ui,
-                        vm,
-                        &mut transition,
-                        Transition::new(before, graphics.screen().clone(), duration_ms),
-                    )?;
+                    let mut effect =
+                        Transition::new(before, graphics.screen().clone(), duration_ms);
+                    if effect_kind == 0 && parameter == 2 && matches!(direction, 0 | 1) {
+                        if let Some(ui) = ui.as_deref_mut()
+                            && let Some(pixels) = ui.masks.get(&mask)?
+                        {
+                            effect.effect = TransitionEffect::Mask {
+                                pixels,
+                                reversed: direction == 1,
+                            };
+                        }
+                    } else {
+                        eprintln!(
+                            "GGE kind {effect_kind}/parameter {parameter}/direction {direction} uses a cross-fade fallback"
+                        );
+                    }
+                    dispatch_transition(&mut ui, vm, &mut transition, effect)?;
                 }
             }
             Step::Shake {
@@ -907,6 +1411,9 @@ fn run_until_input_or_story(
                     destination: 0,
                     destination_x: destination[0],
                     destination_y: destination[1],
+                    effect_color: 0,
+                    color_cut: 0,
+                    extension: [0; 4],
                 })?;
                 let mut effect = Transition::new(before, graphics.screen().clone(), duration_ms);
                 effect.effect = TransitionEffect::Scroll {
@@ -973,6 +1480,7 @@ fn run_until_input_or_story(
                     .join(format!("{name}.OGG"));
                 if let Some(ui) = ui.as_deref_mut() {
                     ui.play_voice(&path)?;
+                    ui.page_voices.push(path.clone());
                     println!("VM {position}: PCML playing {bank}/{name}");
                 } else {
                     println!("VM {position}: PCML {bank}/{name} (headless probe)");
@@ -981,6 +1489,22 @@ fn run_until_input_or_story(
             Step::VoiceStopped => {
                 if let Some(ui) = ui.as_deref_mut() {
                     ui.stop_voice();
+                }
+            }
+            Step::MouseRange(range) => {
+                if let Some(ui) = ui.as_deref_mut() {
+                    let bounds =
+                        range.map(|range| scale_mouse_range(range, ui.canvas.window().size()));
+                    ui.canvas
+                        .window()
+                        .set_mouse_rect(bounds)
+                        .map_err(|error| format!("IMS could not set mouse range: {error}"))?;
+                    ui.mouse_range = Some(range);
+                }
+            }
+            Step::MousePosition { x, y } => {
+                if let Some(ui) = ui.as_deref_mut() {
+                    ui.warp_mouse(x, y);
                 }
             }
             Step::GraphicBank(bank) => graphics.set_bank(&bank)?,
@@ -992,8 +1516,14 @@ fn run_until_input_or_story(
             Step::Blit(operation) => {
                 if matches!(operation.command, 24 | 25 | 28 | 29) {
                     println!(
-                        "VM {position}: GP {} uses cross-fade approximation; extended effect parameters are pending",
-                        operation.command
+                        "VM {position}: GP {} uses cross-fade approximation; extra parameters=[{}, {}, {}, {}, {}, {}]",
+                        operation.command,
+                        operation.effect_color,
+                        operation.color_cut,
+                        operation.extension[0],
+                        operation.extension[1],
+                        operation.extension[2],
+                        operation.extension[3],
                     );
                 }
                 let before = graphics.screen().clone();
@@ -1005,15 +1535,29 @@ fn run_until_input_or_story(
                     let mut effect =
                         Transition::new(before, graphics.screen().clone(), operation.duration());
                     effect.effect = match operation.command {
-                        15 => TransitionEffect::Blinds {
-                            vertical: false,
-                            stripe: 16,
-                        },
-                        16 => TransitionEffect::Blinds {
-                            vertical: true,
-                            stripe: 16,
-                        },
-                        17 => TransitionEffect::Wipe,
+                        15..=17 => {
+                            let packed = operation.effect_color;
+                            let color = [
+                                ((packed & 0x3f) * 4) as u8,
+                                (((packed >> 6) & 0x3f) * 4) as u8,
+                                (((packed >> 12) & 0x3f) * 4) as u8,
+                            ];
+                            TransitionEffect::Blinds {
+                                vertical: operation.command != 15,
+                                stripe: if operation.command == 17 {
+                                    operation.width.max(1) as u32
+                                } else {
+                                    32
+                                },
+                                rect: [
+                                    operation.destination_x,
+                                    operation.destination_y,
+                                    operation.width,
+                                    operation.height,
+                                ],
+                                color,
+                            }
+                        }
                         _ => TransitionEffect::Fade,
                     };
                     dispatch_transition(&mut ui, vm, &mut transition, effect)?;
@@ -1050,6 +1594,11 @@ fn run_until_input_or_story(
                 return Ok((transition, RunOutcome::Unsupported));
             }
             Step::Yield => {
+                if let Some(ui) = ui.as_deref_mut()
+                    && !ui.wait_script(vm, 16)?
+                {
+                    return Ok((transition, RunOutcome::Reached));
+                }
                 vm.advance_clock(16);
                 // A timer poll is making progress even if its PC cycles.
                 history.clear();
@@ -1057,12 +1606,20 @@ fn run_until_input_or_story(
                 repeats = 0;
             }
             Step::Wait(milliseconds) => {
-                if ui.is_some() {
-                    std::thread::sleep(Duration::from_millis(milliseconds));
+                println!("VM {position}: WRF wait {milliseconds}ms");
+                if let Some(ui) = ui.as_deref_mut()
+                    && !ui.wait_script(vm, milliseconds)?
+                {
+                    return Ok((transition, RunOutcome::Reached));
                 }
                 vm.advance_clock(milliseconds);
             }
-            Step::Finished => return Ok((transition, RunOutcome::Finished)),
+            Step::Finished => {
+                if let Some(ui) = ui.as_deref_mut() {
+                    ui.quit_requested = true;
+                }
+                return Ok((transition, RunOutcome::Finished));
+            }
             Step::ControlFlow => {}
         }
     }
@@ -1085,12 +1642,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     let probe_story = probe_save || mode.as_deref() == Some("--probe-story");
     let probe_start = probe_story || mode.as_deref() == Some("--probe-start");
     let script_bytes = std::fs::read(&script_path)?;
+    let chinese = matches!(
+        std::env::var("IKURA_LANG").as_deref(),
+        Ok("zh") | Ok("zh-CN")
+    );
+    let translation_bytes = if chinese {
+        let path = std::env::var_os("IKURA_TRANSLATIONS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data/zh-CN.json"));
+        Some(std::fs::read(&path).map_err(|error| {
+            format!(
+                "Chinese text pack {} is unavailable: {error}",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
     let script_signature = save::script_signature(&script_bytes);
     let scripts: Scripts = serde_json::from_slice(&script_bytes)?;
-    let quicksave_path = std::env::var_os("IKURA_SAVE_DIR")
+    let save_root = std::env::var_os("IKURA_SAVE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join("rust-saves"))
-        .join("quicksave.json");
+        .unwrap_or_else(|| {
+            data_dir.join(if chinese {
+                "rust-saves-zh"
+            } else {
+                "rust-saves"
+            })
+        });
     let start = scripts.get("START").ok_or("START script missing")?;
     let title_script = scripts.get("TITLE").ok_or("TITLE script missing")?;
 
@@ -1114,15 +1693,78 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut vm = Vm::new(scripts, "START")?;
+    if let Some(bytes) = &translation_bytes {
+        let pack: TranslationPack = serde_json::from_slice(bytes)?;
+        println!(
+            "Chinese pack: {} pages, {} choices, {} chapters, {} names",
+            pack.pages.len(),
+            pack.choices.len(),
+            pack.chapters.len(),
+            pack.names.len()
+        );
+        vm.set_translations(pack);
+    }
     let image_dir = data_dir.join("PNG-images/GGD");
     let mut graphics = Graphics::new(image_dir.clone(), WIDTH, HEIGHT);
+    if chinese {
+        graphics.set_localized_root(data_dir.join("PNG-images/ggd_sc"));
+    }
     let mut video_ui = if probe_start {
         None
     } else {
-        Some(VideoUi::new()?)
+        Some(VideoUi::new(&data_dir)?)
     };
+    if let Some(ui) = &mut video_ui {
+        ui.settings = settings::Settings::load(&save_root);
+        if let Err(e) = ui.apply_settings() {
+            eprintln!("Display setting unavailable: {e}");
+            ui.settings.fullscreen = false;
+        }
+    }
+    if mode.as_deref() == Some("--probe-audio-ui") {
+        let ui = video_ui.as_mut().ok_or("SDL window missing")?;
+        ui.settings.music = 23;
+        ui.settings.sound = 47;
+        ui.settings.voice = 65;
+        ui.ensure_mixer()?;
+        ui.apply_volumes();
+        assert_eq!(Music::get_volume(), 23 * 128 / 100);
+        assert_eq!(Channel(1).get_volume(), 47 * 128 / 100);
+        assert_eq!(Channel(0).get_volume(), 65 * 128 / 100);
+        assert_eq!(Channel(2).get_volume(), 65 * 128 / 100);
+        let voice = data_dir.join("OGG-audio/VOICE2/MSM2712.OGG");
+        ui.start_music(&data_dir.join("OGG-audio/WMSC/25.OGG"))?;
+        ui.play_voice(&voice)?;
+        ui.pause_dialogue_voice();
+        assert!(Channel(0).is_paused());
+        ui.queue_replay(
+            vec![PathBuf::from("OGG-audio/VOICE2/MSM2712.OGG")],
+            &data_dir,
+        )?;
+        assert!(Channel(2).is_playing());
+        assert!(Channel(0).is_paused());
+        ui.stop_replay();
+        ui.resume_dialogue_voice();
+        assert!(!Channel(0).is_paused());
+        ui.restore_voice(&voice, 500)?;
+        assert!(ui.voice_playing());
+        assert!(ui.audio_state().voice_position_ms >= 500);
+        Music::set_pos(1.0)?;
+        println!(
+            "Audio UI probe passed: independent volumes, isolated history replay, pause/resume, voice/music seeking"
+        );
+        return Ok(());
+    }
     if mode.as_deref() == Some("--demo-animation") {
         demo_animations(
+            &data_dir,
+            video_ui.as_mut().ok_or("SDL window missing")?,
+            &mut vm,
+        )?;
+        return Ok(());
+    }
+    if mode.as_deref() == Some("--demo-masks") {
+        demo_masks(
             &data_dir,
             video_ui.as_mut().ok_or("SDL window missing")?,
             &mut vm,
@@ -1227,6 +1869,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .ok()
                 .and_then(|value| value.parse::<u8>().ok())
                 .unwrap_or(0);
+            let choice_sequence = std::env::var("IKURA_PROBE_CHOICES")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter(|item| !item.trim().is_empty())
+                        .map(|item| item.trim().parse::<u8>())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let mut choice_index = 0usize;
+            let mut visited_scripts = std::collections::BTreeSet::new();
             let frame_budget = std::env::var("IKURA_PROBE_FRAMES")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -1235,6 +1889,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut page_count = 1;
             let mut stop_reason = "page_limit";
             while page_count < page_limit {
+                if let Some((script, _)) = vm.position() {
+                    visited_scripts.insert(script.to_owned());
+                }
                 if vm.waiting_for_choice() {
                     println!("Story choices: {:?}", vm.choice_options());
                     if let Some(path) = std::env::var_os("IKURA_DUMP_CHOICE") {
@@ -1247,8 +1904,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                             )
                             .save(path)?;
                     }
-                    vm.choose(choice_value)?;
-                    println!("Story probe selected choice {choice_value}");
+                    let selected = choice_sequence
+                        .as_ref()
+                        .and_then(|choices| choices.get(choice_index))
+                        .copied()
+                        .unwrap_or(choice_value);
+                    vm.choose(selected)?;
+                    println!("Story probe choice #{choice_index}: selected {selected}");
+                    choice_index += 1;
                 } else {
                     vm.clear_text_page();
                     vm.click();
@@ -1291,6 +1954,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else if let Some(page) = vm.text_page() {
                     println!("Next story page: {}", page.render());
                     page_count += 1;
+                } else if is_title_input(&vm) {
+                    visited_scripts.insert("TITLE".into());
+                    stop_reason = "returned_to_title";
+                    break;
+                } else if vm.waiting_for_menu_input() {
+                    // Credits and a few scene scripts poll clicks without
+                    // showing a dialogue page. The next probe iteration
+                    // supplies that click just like the GUI event loop.
+                    continue;
                 } else {
                     println!("Story probe paused at {:?}", vm.position());
                     stop_reason = "no_text_boundary";
@@ -1298,8 +1970,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             println!(
-                "Story probe summary: pages={page_count} reason={stop_reason} position={:?}",
+                "Story probe summary: pages={page_count} choices={choice_index} reason={stop_reason} position={:?}",
                 vm.position()
+            );
+            println!(
+                "Story probe visited scripts: {}",
+                visited_scripts.into_iter().collect::<Vec<_>>().join(", ")
             );
             if let Some((path, expected_vm, expected_screen)) = save_probe {
                 save::read(&path, script_signature, &mut vm, &mut graphics)?;
@@ -1332,13 +2008,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut ui = video_ui.ok_or("SDL window was not created")?;
+    let menu_text = TextRenderer::new()?;
+    let mut save_menu: Option<save_menu::SaveMenu> = None;
+    let mut menu_started = std::time::Instant::now();
+    let mut notice: Option<(String, std::time::Instant)> = None;
     let creator = ui.canvas.texture_creator();
-    let title = texture_from_rgba(&creator, graphics.screen())?;
     let mut background = texture_from_rgba(&creator, graphics.screen())?;
     let mut hover = None;
     let mut preview = false;
     let mut text_renderer: Option<TextRenderer> = None;
     let mut story_frame = StoryFrame::new();
+    let mut story_history: Vec<history::Entry> = Vec::new();
+    let mut history_panel = history::Panel::default();
+    let mut settings_panel: Option<settings::Panel> = None;
+    let mut autosave_position: Option<(String, usize)> = None;
+    let mut autosave_at = std::time::Instant::now() - Duration::from_secs(30);
+    let mut history_open = false;
+
+    let mut history_background: Option<RgbaImage> = None;
     let mut choosing = false;
     let mut choice_hover: Option<u8> = None;
     let mut auto_mode = false;
@@ -1352,16 +2039,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     'running: loop {
-        let mut pending_events: Vec<_> = if next_transition.is_some() {
-            // Keep animating while still handling input between frames.
-            ui.events.poll_iter().collect()
+        ui.sync_cursor(
+            &vm,
+            (preview && auto_mode && !choosing && save_menu.is_none()).then_some(4),
+        )?;
+        let mut pending_events = std::mem::take(&mut ui.deferred_events);
+        if next_transition.is_some() || !pending_events.is_empty() {
+            pending_events.extend(ui.events.poll_iter());
         } else {
-            ui.events.wait_timeout_iter(16).collect()
-        };
-        let auto_delay = vm.text_page().map_or(1500, |page| {
-            (800 + page.body.chars().count() as u64 * 55).clamp(1500, 8000)
-        }) + dialogue_chars(&vm) as u64 * vm.text_interval_ms();
+            pending_events.extend(ui.events.wait_timeout_iter(16));
+        }
+        let text_interval = ui.settings.text_interval(vm.text_interval_ms());
+        let auto_delay = ui.settings.auto_delay(dialogue_chars(&vm))
+            + dialogue_chars(&vm) as u64 * text_interval;
         let advance = preview
+            && save_menu.is_none()
+            && settings_panel.is_none()
+            && !history_open
             && !choosing
             && !dialogue_hidden
             && vm.text_visible()
@@ -1385,7 +2079,209 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         }
         for event in pending_events {
+            if matches!(event, Event::Quit { .. }) {
+                break 'running;
+            }
+            if let Some(panel) = &mut settings_panel {
+                let previous = ui.settings.clone();
+                let close = panel.handle(&event, &mut ui.settings);
+                if previous != ui.settings {
+                    if let Err(e) = ui.apply_settings() {
+                        ui.settings = previous;
+                        ui.apply_volumes();
+                        panel.status = format!("Could not apply: {e}");
+                    }
+                    reveal.rendered = None;
+                }
+                if close {
+                    match ui.settings.store(&save_root) {
+                        Ok(()) => {
+                            notice = Some(("Settings saved".into(), std::time::Instant::now()))
+                        }
+                        Err(e) => {
+                            notice = Some((
+                                format!("Settings could not be saved: {e}"),
+                                std::time::Instant::now(),
+                            ))
+                        }
+                    }
+                    settings_panel = None;
+                    ui.resume_dialogue_voice();
+                    let paused = menu_started.elapsed();
+                    page_started += paused;
+                    reveal_started += paused;
+                }
+                continue;
+            }
+            if history_open {
+                match history_panel.handle(&event) {
+                    history::Action::Close => {
+                        history_open = false;
+                        history_background = None;
+                        ui.stop_replay();
+                        ui.resume_dialogue_voice();
+                        let paused = menu_started.elapsed();
+                        page_started += paused;
+                        reveal_started += paused;
+                    }
+                    history::Action::Replay(paths) => {
+                        history_panel.status.clear();
+                        if let Err(e) = ui.queue_replay(paths, &data_dir) {
+                            ui.stop_replay();
+                            history_panel.status = format!("Voice replay failed: {e}");
+                            notice = Some((
+                                format!("Voice replay failed: {e}"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                    history::Action::None => {}
+                }
+                continue;
+            }
+            if save_menu.is_none()
+                && next_transition.is_none()
+                && (matches!(
+                    event,
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F10),
+                        repeat: false,
+                        ..
+                    }
+                ) || matches!(event,Event::MouseButtonDown{mouse_btn:MouseButton::Left,x,y,..} if Rect::new(530,8,104,26).contains_point((x,y))))
+            {
+                auto_mode = false;
+                ui.pause_dialogue_voice();
+                menu_started = std::time::Instant::now();
+                let mut frame = graphics.screen().clone();
+                if let Some(page) = vm.text_page() {
+                    let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                    frame =
+                        menu_text.draw_page(&frame, page.speaker.as_deref(), &page.body, &layout);
+                }
+                settings_panel = Some(settings::Panel::new(frame));
+                continue;
+            }
+            let mut target_slot = save::Slot::Quick;
+            let event = if let Some(menu) = &mut save_menu {
+                match menu.handle(&event) {
+                    save_menu::Action::None => continue,
+                    save_menu::Action::Delete(slot) => {
+                        match save::delete_slot(&save_root, slot) {
+                            Ok(()) => {
+                                menu.status = format!("Deleted: {}", save_menu::slot_name(slot))
+                            }
+                            Err(e) => menu.status = format!("Delete failed: {e}"),
+                        }
+                        menu.refresh(&save_root, script_signature);
+                        continue;
+                    }
+                    save_menu::Action::Close => {
+                        save_menu = None;
+                        let paused = menu_started.elapsed();
+                        page_started += paused;
+                        reveal_started += paused;
+                        continue;
+                    }
+                    action @ (save_menu::Action::Save(slot) | save_menu::Action::Load(slot)) => {
+                        target_slot = slot;
+                        menu.status = if matches!(action, save_menu::Action::Save(_)) {
+                            "Saving..."
+                        } else {
+                            "Loading..."
+                        }
+                        .into();
+                        let texture = texture_from_rgba(&creator, &menu.draw(&menu_text))?;
+                        draw(&mut ui.canvas, &texture, true, None, &vm)?;
+                        ui.canvas.present();
+                        Event::KeyDown {
+                            timestamp: 0,
+                            window_id: ui.canvas.window().id(),
+                            keycode: Some(if matches!(action, save_menu::Action::Save(_)) {
+                                Keycode::F5
+                            } else {
+                                Keycode::F9
+                            }),
+                            scancode: None,
+                            keymod: sdl2::keyboard::Mod::NOMOD,
+                            repeat: false,
+                        }
+                    }
+                }
+            } else {
+                event
+            };
+            if let Event::KeyDown {
+                keycode: Some(key),
+                repeat: false,
+                ..
+            } = &event
+                && let Some(direction) = keyboard_direction(*key)
+            {
+                if preview && choosing {
+                    let next = match choice_hover {
+                        Some(current) => vm.key_neighbor(Some(current), direction),
+                        None => vm.key_default(),
+                    };
+                    if let Some(value) = next.filter(|value| {
+                        vm.choice_options()
+                            .iter()
+                            .any(|option| option.value == *value)
+                    }) {
+                        choice_hover = Some(value);
+                    }
+                } else if !preview && vm.waiting_for_menu_input() {
+                    hover = Some(match hover {
+                        Some(current) => vm.key_neighbor(Some(current as u8), direction),
+                        None => vm.key_default(),
+                    })
+                    .flatten()
+                    .map(usize::from);
+                }
+                continue;
+            }
             let event = match event {
+                Event::KeyDown {
+                    keycode: Some(Keycode::Return),
+                    repeat: false,
+                    ..
+                } if preview && choosing && choice_hover.or(vm.key_default()).is_some() => {
+                    let selected = choice_hover.or(vm.key_default());
+                    let option = vm
+                        .choice_options()
+                        .iter()
+                        .find(|option| Some(option.value) == selected)
+                        .expect("keyboard choice selection is present");
+                    Event::MouseButtonDown {
+                        timestamp: 0,
+                        window_id: ui.canvas.window().id(),
+                        which: 0,
+                        mouse_btn: MouseButton::Left,
+                        clicks: 1,
+                        x: option.x + option.width / 2,
+                        y: option.y + option.height / 2,
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Return),
+                    repeat: false,
+                    ..
+                } if !preview
+                    && vm.waiting_for_menu_input()
+                    && hover.or(vm.key_default().map(usize::from)).is_some() =>
+                {
+                    let selected = hover.or(vm.key_default().map(usize::from)).unwrap();
+                    let rect = menu_rect(&vm, selected).expect("selected title area exists");
+                    Event::MouseButtonDown {
+                        timestamp: 0,
+                        window_id: ui.canvas.window().id(),
+                        which: 0,
+                        mouse_btn: MouseButton::Left,
+                        clicks: 1,
+                        x: rect.x + rect.width() as i32 / 2,
+                        y: rect.y + rect.height() as i32 / 2,
+                    }
+                }
                 Event::KeyDown {
                     keycode: Some(Keycode::Space | Keycode::Return),
                     repeat: false,
@@ -1404,18 +2300,54 @@ fn main() -> Result<(), Box<dyn Error>> {
                     y,
                     mouse_btn: MouseButton::Left,
                     ..
-                } if !preview && menu_at(&vm, x, y) == Some(1) => Event::KeyDown {
-                    timestamp: 0,
-                    window_id: ui.canvas.window().id(),
-                    keycode: Some(Keycode::F9),
-                    scancode: None,
-                    keymod: sdl2::keyboard::Mod::NOMOD,
-                    repeat: false,
-                },
+                } if !preview && is_title_input(&vm) && menu_at(&vm, x, y) == Some(1) => {
+                    Event::KeyDown {
+                        timestamp: 0,
+                        window_id: ui.canvas.window().id(),
+                        keycode: Some(Keycode::F8),
+                        scancode: None,
+                        keymod: sdl2::keyboard::Mod::NOMOD,
+                        repeat: false,
+                    }
+                }
                 event => event,
             };
             match event {
                 Event::Quit { .. } => break 'running,
+                Event::KeyDown {
+                    keycode: Some(code @ (Keycode::F6 | Keycode::F8)),
+                    repeat: false,
+                    ..
+                } if next_transition.is_none() => {
+                    auto_mode = false;
+                    let mut frame = graphics.screen().clone();
+                    if preview && !dialogue_hidden && vm.text_visible() {
+                        if choosing {
+                            frame = menu_text.draw_choices(&frame, vm.choice_options(), None);
+                        } else if let Some(page) = vm.text_page() {
+                            let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                            frame = menu_text.draw_page(
+                                &frame,
+                                page.speaker.as_deref(),
+                                &page.body,
+                                &layout,
+                            );
+                        }
+                    }
+                    save_menu = Some(save_menu::SaveMenu::new(
+                        if code == Keycode::F6 {
+                            save_menu::Mode::Save
+                        } else {
+                            save_menu::Mode::Load
+                        },
+                        &save_root,
+                        script_signature,
+                        frame,
+                        preview && vm.can_save(),
+                        preview,
+                    ));
+                    menu_started = std::time::Instant::now();
+                }
                 Event::KeyDown {
                     keycode: Some(Keycode::A),
                     repeat: false,
@@ -1428,6 +2360,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         "Kazoku Keikaku - manual"
                     })?;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::B),
+                    repeat: false,
+                    ..
+                } if preview && !choosing && save_menu.is_none() => {
+                    auto_mode = false;
+                    let mut frame = graphics.screen().clone();
+                    if let Some(page) = vm.text_page() {
+                        let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                        frame = menu_text.draw_page(
+                            &frame,
+                            page.speaker.as_deref(),
+                            &page.body,
+                            &layout,
+                        );
+                    }
+                    history_background = Some(frame);
+                    history_panel = history::Panel::default();
+                    ui.pause_dialogue_voice();
+                    menu_started = std::time::Instant::now();
+                    history_open = true;
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::H),
@@ -1446,27 +2400,58 @@ fn main() -> Result<(), Box<dyn Error>> {
                     repeat: false,
                     ..
                 } if preview && next_transition.is_none() => {
-                    let audio = save::AudioState {
-                        music: if ui.mixer_context.is_some() && Music::is_playing() {
-                            ui.music_path.clone()
-                        } else {
-                            None
+                    let audio = ui.audio_state();
+                    let path = save::slot_path(&save_root, target_slot);
+                    let mut frame = graphics.screen().clone();
+                    if choosing {
+                        frame = menu_text.draw_choices(&frame, vm.choice_options(), None);
+                    } else if let Some(page) = vm.text_page() {
+                        let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                        frame = menu_text.draw_page(
+                            &frame,
+                            page.speaker.as_deref(),
+                            &page.body,
+                            &layout,
+                        );
+                    }
+                    match save::write_with_session(
+                        &path,
+                        script_signature,
+                        &vm,
+                        &graphics,
+                        audio,
+                        &frame,
+                        &history::Session {
+                            history: story_history.clone(),
                         },
-                        voice: if ui.voice_playing() {
-                            ui.voice_path.clone()
-                        } else {
-                            None
-                        },
-                    };
-                    match save::write(&quicksave_path, script_signature, &vm, &graphics, audio) {
+                    ) {
                         Ok(()) => {
-                            println!("Quick save: {}", quicksave_path.display());
+                            println!(
+                                "Quick save: {} (chapter: {})",
+                                path.display(),
+                                vm.save_title().unwrap_or("untitled")
+                            );
+                            let message = format!("Saved: {}", save_menu::slot_name(target_slot));
+                            if let Some(menu) = &mut save_menu {
+                                menu.refresh(&save_root, script_signature);
+                                menu.status = message.clone();
+                            }
+                            notice = Some((message, std::time::Instant::now()));
                             ui.canvas
                                 .window_mut()
-                                .set_title("Kazoku Keikaku - quick save stored")?;
+                                .set_title("Kazoku Keikaku - save stored")?;
                         }
                         Err(error) => {
                             eprintln!("Quick save failed: {error}");
+                            let message = if !vm.can_save() {
+                                "Saving is disabled at this point."
+                            } else {
+                                "Save failed. Check storage space and folder permissions."
+                            };
+                            if let Some(menu) = &mut save_menu {
+                                menu.status = message.into();
+                            }
+                            notice = Some((message.into(), std::time::Instant::now()));
                             ui.canvas
                                 .window_mut()
                                 .set_title("Quick save failed - see console")?;
@@ -1477,18 +2462,58 @@ fn main() -> Result<(), Box<dyn Error>> {
                     keycode: Some(Keycode::F9),
                     repeat: false,
                     ..
-                } => match save::read(&quicksave_path, script_signature, &mut vm, &mut graphics) {
-                    Ok(audio) => {
+                } => match save::read_session_with_backup(
+                    &save::load_path(&save_root, target_slot),
+                    script_signature,
+                    &mut vm,
+                    &mut graphics,
+                ) {
+                    Ok((audio, session, recovered)) => {
+                        story_history = session.history;
+                        ui.page_voices.clear();
+                        autosave_position = vm.position().map(|(n, o)| (n.to_owned(), o));
+                        autosave_at = std::time::Instant::now();
                         ui.stop_music();
                         ui.stop_sound();
                         ui.stop_voice();
-                        if let Some(path) = audio.music.filter(|_| vm.should_restore_music()) {
-                            ui.start_music(&path)?;
+                        let mut audio_failed = false;
+                        if let Some(path) = audio.music.filter(|_| vm.should_restore_music())
+                            && let Err(error) = ui.start_music(&path)
+                        {
+                            audio_failed = true;
+                            eprintln!("Loaded save, music unavailable: {error}");
+                        } else if ui.music_path.is_some() && audio.music_position_ms > 0 {
+                            if let Err(e) = Music::set_pos(audio.music_position_ms as f64 / 1000.) {
+                                audio_failed = true;
+                                eprintln!("Music seek failed: {e}");
+                            } else {
+                                ui.music_offset_ms = audio.music_position_ms;
+                                ui.music_started = Some(std::time::Instant::now());
+                            }
                         }
-                        if let Some(path) = audio.voice {
-                            ui.play_voice(&path)?;
+                        if let Some(path) = audio.voice
+                            && let Err(error) = ui.restore_voice(&path, audio.voice_position_ms)
+                        {
+                            audio_failed = true;
+                            eprintln!("Loaded save, voice unavailable: {error}");
                         }
                         preview = true;
+                        save_menu = None;
+                        ui.deferred_events.clear();
+                        notice = Some((
+                            format!(
+                                "Loaded: {}{}",
+                                save_menu::slot_name(target_slot),
+                                if audio_failed {
+                                    " (audio unavailable)"
+                                } else if recovered {
+                                    " (backup recovered)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            std::time::Instant::now(),
+                        ));
                         choosing = vm.waiting_for_choice();
                         choice_hover = None;
                         auto_mode = false;
@@ -1514,13 +2539,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         text_renderer = Some(renderer);
                         background = texture_from_rgba(&creator, &frame)?;
-                        println!("Quick load: {:?}", vm.position());
+                        println!(
+                            "Quick load: {:?} (chapter: {})",
+                            vm.position(),
+                            vm.save_title().unwrap_or("untitled")
+                        );
                         ui.canvas
                             .window_mut()
-                            .set_title("Kazoku Keikaku - quick save restored")?;
+                            .set_title("Kazoku Keikaku - save restored")?;
                     }
                     Err(error) => {
                         eprintln!("Quick load failed: {error}");
+                        let message = if error.to_string().contains("different script") {
+                            "This save belongs to different game data."
+                        } else {
+                            "Could not load save: missing, damaged, or unavailable assets."
+                        };
+                        if let Some(menu) = &mut save_menu {
+                            menu.status = message.into();
+                        }
+                        notice = Some((message.into(), std::time::Instant::now()));
                         ui.canvas
                             .window_mut()
                             .set_title("Quick load failed - see console")?;
@@ -1570,6 +2608,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if ui.quit_requested {
                             break 'running;
                         }
+                        record_history_page(&mut story_history, &vm, &mut ui, &data_dir);
                         choosing = vm.waiting_for_choice();
                         page_started = std::time::Instant::now();
                         reveal_started = page_started;
@@ -1606,16 +2645,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     mouse_btn: MouseButton::Left,
                     ..
                 } if !preview => {
-                    if let Some(index) = menu_at(&vm, x, y) {
-                        if index == 3 {
+                    if let Some(index) = menu_at(&vm, x, y).filter(|_| vm.waiting_for_menu_input())
+                    {
+                        let is_title = is_title_input(&vm);
+                        if index == 3 && is_title {
                             break 'running;
                         }
-                        if index == 0 {
+                        if index == 0 && is_title {
                             // TITLE clears its BGM registers before LS SNR00,
                             // but that branch contains no standalone MS/MF.
                             // End the menu track when starting a new game so
                             // the unvoiced opening cannot inherit title music.
                             ui.stop_music();
+                            story_history.clear();
                             println!("Title -> new game: stopped title music");
                         }
                         vm.set_selected(Some(index as i16));
@@ -1641,6 +2683,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if ui.quit_requested {
                             break 'running;
                         }
+                        record_history_page(&mut story_history, &vm, &mut ui, &data_dir);
                         let mut frame = graphics.screen().clone();
                         if let Some(page) = vm.text_page() {
                             let renderer = TextRenderer::new()?;
@@ -1690,7 +2733,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if !ui.skip_held()
                         && reveal.consume_click(
                             dialogue_chars(&vm),
-                            vm.text_interval_ms(),
+                            ui.settings.text_interval(vm.text_interval_ms()),
                             reveal_started.elapsed(),
                         )
                     {
@@ -1724,6 +2767,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if ui.quit_requested {
                         break 'running;
                     }
+                    record_history_page(&mut story_history, &vm, &mut ui, &data_dir);
                     choosing = vm.waiting_for_choice();
                     if choosing {
                         auto_mode = false;
@@ -1762,6 +2806,69 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 _ => {}
             }
+            if ui.quit_requested {
+                break 'running;
+            }
+            if preview && is_title_input(&vm) {
+                break;
+            }
+        }
+        if let Some(panel) = &settings_panel {
+            let frame = panel.draw(&menu_text, &ui.settings);
+            let texture = texture_from_rgba(&creator, &frame)?;
+            draw(&mut ui.canvas, &texture, true, None, &vm)?;
+            ui.canvas.present();
+            continue;
+        }
+        if history_open {
+            if let Err(e) = ui.tick_replay() {
+                ui.stop_replay();
+                history_panel.status = format!("Voice replay failed: {e}");
+                notice = Some((
+                    format!("Voice replay failed: {e}"),
+                    std::time::Instant::now(),
+                ));
+            }
+            if let Some(frame) = &history_background {
+                let frame = history_panel.draw(&menu_text, frame, &story_history);
+                let texture = texture_from_rgba(&creator, &frame)?;
+                draw(&mut ui.canvas, &texture, true, None, &vm)?;
+                ui.canvas.present();
+                continue;
+            }
+        }
+        if let Some(menu) = &save_menu {
+            let frame = menu.draw(&menu_text);
+            let texture = texture_from_rgba(&creator, &frame)?;
+            draw(&mut ui.canvas, &texture, true, None, &vm)?;
+            ui.canvas.present();
+            std::thread::sleep(Duration::from_millis(4));
+            continue;
+        }
+        if preview && is_title_input(&vm) {
+            // The script has rebuilt TITLE and reached its menu poll. Refresh
+            // the scene texture and discard the story UI before accepting menu
+            // input; otherwise the final dialogue can cover the title screen.
+            preview = false;
+            choosing = false;
+            choice_hover = None;
+            hover = None;
+            auto_mode = false;
+            dialogue_hidden = false;
+            next_transition = None;
+            text_renderer = None;
+            story_frame = StoryFrame::new();
+            reveal = DialogueReveal::default();
+            vm.clear_text_page();
+            vm.set_selected(None);
+            ui.deferred_events.clear();
+            ui.stop_voice();
+            ui.stop_sound();
+            background = texture_from_rgba(&creator, graphics.screen())?;
+            ui.canvas
+                .window_mut()
+                .set_title("Kazoku Keikaku - Rust prototype")?;
+            println!("Story -> TITLE: restored menu input and title frame");
         }
         if let Some(pending) = &mut next_transition {
             let finished = pending.transition.advance(Duration::from_millis(16));
@@ -1781,6 +2888,46 @@ fn main() -> Result<(), Box<dyn Error>> {
                 reveal = DialogueReveal::default();
             }
         }
+        if preview && ui.settings.autosave && vm.can_save() && next_transition.is_none() {
+            let position = vm.position().map(|(n, o)| (n.to_owned(), o));
+            if checkpoint_due(
+                autosave_position.as_ref(),
+                position.as_ref(),
+                choosing,
+                autosave_at.elapsed(),
+            ) {
+                let mut frame = graphics.screen().clone();
+                if choosing {
+                    frame = menu_text.draw_choices(&frame, vm.choice_options(), None);
+                } else if let Some(page) = vm.text_page() {
+                    let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                    frame =
+                        menu_text.draw_page(&frame, page.speaker.as_deref(), &page.body, &layout);
+                }
+                match save::write_with_session(
+                    &save::slot_path(&save_root, save::Slot::Auto),
+                    script_signature,
+                    &vm,
+                    &graphics,
+                    ui.audio_state(),
+                    &frame,
+                    &history::Session {
+                        history: story_history.clone(),
+                    },
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("Automatic save failed: {e}");
+                        notice = Some((
+                            "Automatic save failed; check storage permissions".into(),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                autosave_position = position;
+                autosave_at = std::time::Instant::now();
+            }
+        }
         vm.tick_frame();
         if preview
             && !choosing
@@ -1788,21 +2935,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             && (dialogue_hidden || !vm.text_visible())
         {
             let scene = texture_from_rgba(&creator, graphics.screen())?;
-            draw(&mut ui.canvas, &title, &scene, preview, hover, &vm)?;
+            draw(&mut ui.canvas, &scene, preview, hover, &vm)?;
         } else if choosing && !vm.choice_options().is_empty() {
-            let frame = TextRenderer::new()?.draw_choices(
-                graphics.screen(),
-                vm.choice_options(),
-                choice_hover,
-            );
+            let frame =
+                menu_text.draw_choices(graphics.screen(), vm.choice_options(), choice_hover);
             let overlay = texture_from_rgba(&creator, &frame)?;
-            draw(&mut ui.canvas, &title, &overlay, preview, hover, &vm)?;
+            draw(&mut ui.canvas, &overlay, preview, hover, &vm)?;
         } else if preview && next_transition.is_none() && vm.text_page().is_some() {
             let total = dialogue_chars(&vm);
             if ui.skip_held() {
                 reveal.completed = true;
             }
-            let visible = reveal.visible(total, vm.text_interval_ms(), reveal_started.elapsed());
+            let visible = reveal.visible(
+                total,
+                ui.settings.text_interval(vm.text_interval_ms()),
+                reveal_started.elapsed(),
+            );
             let marker =
                 visible == total && (reveal_started.elapsed().as_millis() / 500).is_multiple_of(2);
             if reveal.rendered != Some((visible, marker)) {
@@ -1820,13 +2968,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 reveal.rendered = Some((visible, marker));
             }
-            draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
+            draw(&mut ui.canvas, &background, preview, hover, &vm)?;
         } else {
-            draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
+            draw(&mut ui.canvas, &background, preview, hover, &vm)?;
         }
+        if next_transition.is_none() {
+            let mut button = RgbaImage::from_pixel(104, 26, image::Rgba([35, 48, 65, 235]));
+            menu_text.draw_label(&mut button, "Settings F10", 8, 5, 95, 12., [220, 230, 240]);
+            let texture = texture_from_rgba(&creator, &button)?;
+            ui.canvas
+                .copy(&texture, None, Some(Rect::new(530, 8, 104, 26)))?;
+        }
+        if let Some((message, started)) = &notice
+            && started.elapsed() < Duration::from_secs(4)
+        {
+            let mut banner = RgbaImage::from_pixel(600, 32, image::Rgba([25, 35, 50, 255]));
+            menu_text.draw_label(&mut banner, message, 10, 6, 580, 15., [245, 230, 190]);
+            let texture = texture_from_rgba(&creator, &banner)?;
+            ui.canvas
+                .copy(&texture, None, Some(Rect::new(20, 12, 600, 32)))?;
+        }
+        ui.canvas.present();
         if next_transition.is_none() {
             std::thread::sleep(Duration::from_millis(4));
         }
+    }
+    if let Err(error) = ui.settings.store(&save_root) {
+        eprintln!("Settings could not be saved on exit: {error}");
     }
     Ok(())
 }
@@ -1838,6 +3006,172 @@ mod tests {
 
     fn image(color: [u8; 4]) -> RgbaImage {
         RgbaImage::from_pixel(2, 2, image::Rgba(color))
+    }
+
+    #[test]
+    fn automatic_checkpoints_are_throttled_but_preserve_choice_and_chapter_boundaries() {
+        let a = ("A".to_owned(), 100);
+        let b = ("A".to_owned(), 200);
+        let chapter = ("B".to_owned(), 100);
+        assert!(checkpoint_due(None, Some(&a), false, Duration::ZERO));
+        assert!(!checkpoint_due(
+            Some(&a),
+            Some(&a),
+            true,
+            Duration::from_secs(60)
+        ));
+        assert!(!checkpoint_due(
+            Some(&a),
+            Some(&b),
+            false,
+            Duration::from_secs(5)
+        ));
+        assert!(checkpoint_due(Some(&a), Some(&b), true, Duration::ZERO));
+        assert!(checkpoint_due(
+            Some(&a),
+            Some(&chapter),
+            false,
+            Duration::ZERO
+        ));
+        assert!(checkpoint_due(
+            Some(&a),
+            Some(&b),
+            false,
+            Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn ims_range_scales_to_resized_window_and_clamps_to_canvas() {
+        let rect = scale_mouse_range(
+            vm::MouseRange {
+                left: -10,
+                top: 120,
+                right: 320,
+                bottom: 600,
+            },
+            (1280, 960),
+        );
+        assert_eq!((rect.x(), rect.y()), (0, 240));
+        assert_eq!((rect.width(), rect.height()), (640, 720));
+    }
+
+    #[test]
+    fn wait_input_consumes_skip_keys_and_preserves_ui_commands() {
+        let key = |code| Event::KeyDown {
+            timestamp: 0,
+            window_id: 1,
+            keycode: Some(code),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        for code in [Keycode::Space, Keycode::Return] {
+            assert_eq!(wait_input(&key(code)), WaitInput::Skip);
+        }
+        assert_eq!(wait_input(&key(Keycode::Escape)), WaitInput::Quit);
+        assert_eq!(wait_input(&Event::Quit { timestamp: 0 }), WaitInput::Quit);
+        for code in [Keycode::A, Keycode::H, Keycode::F5, Keycode::F9] {
+            assert_eq!(wait_input(&key(code)), WaitInput::Defer);
+        }
+        let click = Event::MouseButtonDown {
+            timestamp: 0,
+            window_id: 1,
+            which: 0,
+            mouse_btn: MouseButton::Left,
+            clicks: 1,
+            x: 10,
+            y: 20,
+        };
+        assert_eq!(wait_input(&click), WaitInput::Skip);
+        assert_eq!(
+            wait_input(&Event::KeyUp {
+                timestamp: 0,
+                window_id: 1,
+                keycode: Some(Keycode::Return),
+                scancode: None,
+                keymod: sdl2::keyboard::Mod::NOMOD,
+                repeat: false
+            }),
+            WaitInput::Ignore
+        );
+    }
+
+    #[test]
+    fn script_return_to_title_stops_at_the_menu_input() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "STORY".into(),
+            vm::Script {
+                code_start: 0,
+                jumps: vec![],
+                instructions: vec![
+                    Instruction {
+                        offset: 0,
+                        opcode: 0x2B,
+                        payload: vec![0, 3, 255, b'A', 0],
+                    },
+                    Instruction {
+                        offset: 1,
+                        opcode: 0x01,
+                        payload: b"TITLE\0".to_vec(),
+                    },
+                ],
+            },
+        );
+        scripts.insert(
+            "TITLE".into(),
+            vm::Script {
+                code_start: 0x7B9,
+                jumps: vec![],
+                instructions: vec![Instruction {
+                    offset: 0x7B9,
+                    opcode: 0x85,
+                    payload: vec![7, 0, 8, 0, 5, 1],
+                }],
+            },
+        );
+        let mut vm = Vm::new(scripts, "STORY").unwrap();
+        let mut graphics = Graphics::new(PathBuf::new(), 1, 1);
+        let (_, outcome) =
+            run_until_input_or_story(&mut vm, &mut graphics, Path::new(""), false, None, false)
+                .unwrap();
+        assert_eq!(outcome, RunOutcome::Reached);
+        assert!(is_title_input(&vm));
+        vm.clear_text_page();
+        vm.set_selected(None);
+        assert!(vm.text_page().is_none());
+        // TITLE's IG uses menu mode 1; a selection consumes that IG rather
+        // than using the dialogue-only InputPoll mode 4.
+        vm.set_selected(Some(0));
+        assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+    }
+
+    #[test]
+    fn mask_transition_preserves_timing_direction_scaling_and_final_frame() {
+        let before = RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 0, 255]));
+        let after = RgbaImage::from_pixel(4, 2, image::Rgba([255, 255, 255, 255]));
+        let mask = image::GrayImage::from_raw(2, 1, vec![0, 255]).unwrap();
+        let mut effect = Transition::new(before.clone(), after.clone(), 1000);
+        effect.effect = TransitionEffect::Mask {
+            pixels: mask.clone(),
+            reversed: false,
+        };
+        assert!(effect.frame() == before);
+        effect.advance(Duration::from_millis(500));
+        let halfway = effect.frame();
+        assert_eq!(halfway.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(halfway.get_pixel(1, 1).0, [255, 255, 255, 255]);
+        assert_eq!(halfway.get_pixel(2, 0).0, [0, 0, 0, 255]);
+        effect.effect = TransitionEffect::Mask {
+            pixels: mask,
+            reversed: true,
+        };
+        let reverse = effect.frame();
+        assert_eq!(reverse.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(reverse.get_pixel(2, 1).0, [255, 255, 255, 255]);
+        assert!(effect.advance(Duration::from_millis(500)));
+        assert!(effect.frame() == after);
     }
 
     #[test]
@@ -1994,7 +3328,7 @@ mod tests {
     }
 
     #[test]
-    fn blinds_reveal_stripes_then_land_on_the_exact_final_frame() {
+    fn blinds_overlay_shrinking_color_slats_then_land_on_final_frame() {
         let from = RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 255]));
         let to = RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
         for vertical in [false, true] {
@@ -2002,13 +3336,23 @@ mod tests {
             effect.effect = TransitionEffect::Blinds {
                 vertical,
                 stripe: 4,
+                rect: [0, 0, 8, 8],
+                color: [200, 10, 20],
             };
             effect.advance(Duration::from_millis(50));
             let frame = effect.frame();
             assert_eq!(frame.pixels().filter(|pixel| pixel[0] == 255).count(), 32);
-            assert_ne!(
-                frame.get_pixel(0, 0),
-                frame.get_pixel(if vertical { 2 } else { 0 }, if vertical { 0 } else { 2 })
+            assert_eq!(
+                frame
+                    .get_pixel(if vertical { 2 } else { 0 }, if vertical { 0 } else { 2 })
+                    .0,
+                [200, 10, 20, 255]
+            );
+            assert_eq!(
+                frame
+                    .get_pixel(if vertical { 0 } else { 2 }, if vertical { 2 } else { 0 })
+                    .0,
+                [255, 255, 255, 255]
             );
             effect.advance(Duration::from_millis(50));
             assert_eq!(effect.frame(), to);
@@ -2142,6 +3486,9 @@ mod tests {
             destination: 1500,
             destination_x: 0,
             destination_y: 0,
+            effect_color: 0,
+            color_cut: 0,
+            extension: [0; 4],
         };
         assert_eq!(op.duration(), 1500);
         op.command = 1;

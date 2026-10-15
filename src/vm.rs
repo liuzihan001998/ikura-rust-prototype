@@ -29,6 +29,23 @@ pub struct Script {
 
 pub type Scripts = HashMap<String, Script>;
 
+/// Optional UTF-8 translations keyed by `SCRIPT:0xOFFSET` of the original
+/// instruction. Keeping the original script bytes preserves control flow.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TranslationPack {
+    pub pages: HashMap<String, TextPage>,
+    pub choices: HashMap<String, String>,
+    pub chapters: HashMap<String, String>,
+    pub names: HashMap<String, String>,
+}
+
+impl TranslationPack {
+    fn key(script: &str, offset: usize) -> String {
+        format!("{script}:0x{offset:X}")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HitArea {
     pub index: u8,
@@ -36,6 +53,14 @@ pub struct HitArea {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseRange {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +112,12 @@ pub struct BlitOp {
     pub destination: i32,
     pub destination_x: i32,
     pub destination_y: i32,
+    /// Optional packed 6-bit RGB overlay color used by GP 15/16/17.
+    pub effect_color: u32,
+    /// Optional color-cut parameter present in some GP payloads.
+    pub color_cut: i32,
+    /// Game-specific extension words present on GP 28/29.
+    pub extension: [i32; 4],
 }
 
 impl BlitOp {
@@ -137,6 +168,10 @@ pub enum Step {
     ShowSurface {
         slot: i32,
         duration_ms: i32,
+        effect_kind: i32,
+        direction: i32,
+        parameter: i32,
+        mask: String,
     },
     Shake {
         count: u16,
@@ -161,6 +196,11 @@ pub enum Step {
         name: String,
     },
     VoiceStopped,
+    MouseRange(Option<MouseRange>),
+    MousePosition {
+        x: i32,
+        y: i32,
+    },
     GraphicBank(String),
     TextPage(TextPage),
     Blit(BlitOp),
@@ -181,6 +221,8 @@ pub enum Step {
 pub struct Vm {
     #[serde(skip)]
     scripts: Scripts,
+    #[serde(skip)]
+    translations: TranslationPack,
     frames: Vec<ScriptFrame>,
     variables: HashMap<u16, i32>,
     #[serde(serialize_with = "serialize_sorted_set")]
@@ -192,10 +234,20 @@ pub struct Vm {
     selected: Option<i16>,
     click_pending: bool,
     hit_areas: HashMap<u8, HitArea>,
+    #[serde(default)]
+    key_map: BTreeMap<u8, [u8; 4]>,
+    #[serde(default)]
+    key_default: Option<u8>,
     text_interval: i32,
     font_size: i32,
     font_style: u8,
+    #[serde(default)]
+    save_title: Option<String>,
     cursor_style: u8,
+    #[serde(default)]
+    mouse_range: Option<MouseRange>,
+    #[serde(default)]
+    cursor_resources: BTreeMap<u8, String>,
     save_enabled: bool,
     popup_enabled: bool,
     delay_ms: u64,
@@ -339,6 +391,7 @@ impl Vm {
             .code_start;
         Ok(Self {
             scripts,
+            translations: TranslationPack::default(),
             frames: vec![ScriptFrame {
                 name: entry.to_owned(),
                 pc,
@@ -352,10 +405,15 @@ impl Vm {
             selected: None,
             click_pending: false,
             hit_areas: HashMap::new(),
+            key_map: BTreeMap::new(),
+            key_default: None,
             text_interval: 25,
             font_size: 0,
             font_style: 0,
+            save_title: None,
             cursor_style: 0,
+            mouse_range: None,
+            cursor_resources: BTreeMap::new(),
             save_enabled: false,
             popup_enabled: false,
             delay_ms: 0,
@@ -379,6 +437,42 @@ impl Vm {
         self.frames
             .last()
             .map(|frame| (frame.name.as_str(), frame.pc))
+    }
+
+    pub fn set_translations(&mut self, translations: TranslationPack) {
+        self.translations = translations;
+    }
+
+    /// True when the current instruction waits for an input event. Mode 1
+    /// polls in gameplay and credits are also boundaries; startup polls run
+    /// internally because they collect engine setup state.
+    pub fn waiting_for_menu_input(&self) -> bool {
+        let Some(frame) = self.frames.last() else {
+            return false;
+        };
+        if self.selected.is_some() || self.click_pending {
+            return false;
+        }
+        self.scripts
+            .get(&frame.name)
+            .and_then(|script| {
+                script
+                    .instructions
+                    .binary_search_by_key(&frame.pc, |instruction| instruction.offset)
+                    .ok()
+                    .and_then(|index| script.instructions.get(index))
+            })
+            .is_some_and(|instruction| {
+                let gameplay_mode_one_poll = instruction.payload.get(4) == Some(&1)
+                    && !matches!(
+                        frame.name.as_str(),
+                        "START" | "BGMLOAD" | "SELOAD" | "TITLE"
+                    );
+                instruction.opcode == 0x85
+                    && (self.text_page.is_some()
+                        || gameplay_mode_one_poll
+                        || matches!(instruction.payload.get(4), Some(0 | 5 | 32)))
+            })
     }
 
     pub fn advance_clock(&mut self, milliseconds: u64) {
@@ -408,6 +502,27 @@ impl Vm {
         &self.hit_areas
     }
 
+    pub fn mouse_range(&self) -> Option<MouseRange> {
+        self.mouse_range
+    }
+
+    /// IHK maps each hit area's up/down/left/right keys to another area.
+    pub fn key_neighbor(&self, current: Option<u8>, direction: usize) -> Option<u8> {
+        if direction >= 4 {
+            return None;
+        }
+        let current = current.or(self.key_default)?;
+        Some(
+            self.key_map
+                .get(&current)
+                .map_or(0, |neighbors| neighbors[direction]),
+        )
+    }
+
+    pub fn key_default(&self) -> Option<u8> {
+        self.key_default
+    }
+
     pub fn speaker_names(&self) -> &HashMap<u8, String> {
         &self.speaker_names
     }
@@ -418,6 +533,22 @@ impl Vm {
 
     pub fn font_size(&self) -> i32 {
         self.font_size
+    }
+
+    pub fn font_style(&self) -> u8 {
+        self.font_style
+    }
+
+    pub fn save_title(&self) -> Option<&str> {
+        self.save_title.as_deref()
+    }
+
+    pub fn cursor_style(&self) -> u8 {
+        self.cursor_style
+    }
+
+    pub fn cursor_resource(&self, id: u8) -> Option<&str> {
+        self.cursor_resources.get(&id).map(String::as_str)
     }
 
     /// PF specifies milliseconds per character; zero displays immediately.
@@ -495,7 +626,13 @@ impl Vm {
         }
         saved.click_pending = false;
         saved.selected = None;
+        if saved.cursor_resources.is_empty() {
+            // Old quicksaves predate IM support; keep the resources registered
+            // by startup instead of losing them when restoring the VM.
+            saved.cursor_resources = self.cursor_resources.clone();
+        }
         saved.scripts = std::mem::take(&mut self.scripts);
+        saved.translations = std::mem::take(&mut self.translations);
         *self = saved;
         Ok(())
     }
@@ -655,6 +792,8 @@ impl Vm {
                 | 0x7F
                 | 0x80
                 | 0x81
+                | 0x82
+                | 0x83
                 | 0x84
                 | 0x85..=0x87
                 | 0x88
@@ -683,8 +822,12 @@ impl Vm {
                 opcode: instruction.opcode,
             });
         }
+        let gameplay_mode_one_poll = instruction.payload.get(4) == Some(&1)
+            && !matches!(name.as_str(), "START" | "BGMLOAD" | "SELOAD" | "TITLE");
         if instruction.opcode == 0x85
-            && self.text_page.is_some()
+            && (self.text_page.is_some()
+                || gameplay_mode_one_poll
+                || matches!(instruction.payload.get(4), Some(0 | 5 | 32)))
             && self.selected.is_none()
             && !self.click_pending
         {
@@ -718,7 +861,6 @@ impl Vm {
             | 0x40
             | 0x48
             | 0x49
-            | 0x80
             | 0x8F
             | 0xA1
             | 0xA5
@@ -733,7 +875,17 @@ impl Vm {
                     let mut content =
                         vec![*instruction.payload.first().ok_or("MPM missing window")?];
                     content.extend_from_slice(&instruction.payload[2..]);
-                    let (page, _) = decode_text_page(&content, &self.speaker_names)?;
+                    let (mut page, _) = decode_text_page(&content, &self.speaker_names)?;
+                    if let Some(translated) = self
+                        .translations
+                        .pages
+                        .get(&TranslationPack::key(&name, instruction.offset))
+                    {
+                        page.body = translated.body.clone();
+                        if translated.speaker.is_some() {
+                            page.speaker = translated.speaker.clone();
+                        }
+                    }
                     self.multi_text.insert(index, page);
                 } else {
                     if instruction.payload.as_slice() != [0, 0, 3, 0x11, 0] {
@@ -808,7 +960,14 @@ impl Vm {
                         error_context()
                     ));
                 }
-                self.speaker_names.insert(index, decoded.into_owned());
+                let decoded = decoded.into_owned();
+                let translated = self
+                    .translations
+                    .names
+                    .get(&decoded)
+                    .cloned()
+                    .unwrap_or(decoded);
+                self.speaker_names.insert(index, translated);
             }
             // These close the command and text windows. Drawing those windows
             // is separate from the VM's control flow.
@@ -826,7 +985,12 @@ impl Vm {
                     .iter()
                     .position(|&byte| byte == 0)
                     .unwrap_or(caption_bytes.len());
-                let caption = shift_jis_string(&caption_bytes[..end])?;
+                let caption = self
+                    .translations
+                    .choices
+                    .get(&TranslationPack::key(&name, instruction.offset))
+                    .cloned()
+                    .unwrap_or(shift_jis_string(&caption_bytes[..end])?);
                 self.choice_options.push(ChoiceOption {
                     value,
                     caption,
@@ -882,6 +1046,16 @@ impl Vm {
             0x2B => {
                 let (mut page, clears_page) =
                     decode_text_page(&instruction.payload, &self.speaker_names)?;
+                if let Some(translated) = self
+                    .translations
+                    .pages
+                    .get(&TranslationPack::key(&name, instruction.offset))
+                {
+                    page.body = translated.body.clone();
+                    if translated.speaker.is_some() {
+                        page.speaker = translated.speaker.clone();
+                    }
+                }
                 if !clears_page && let Some(previous) = &self.text_page {
                     if page.speaker.is_none() {
                         page.speaker = previous.speaker.clone();
@@ -1191,6 +1365,32 @@ impl Vm {
                     destination: read(21)?,
                     destination_x: read(25)?,
                     destination_y: read(29)?,
+                    effect_color: u32_at(data, 33)
+                        .ok()
+                        .map(|value| self.decode_value(value))
+                        .unwrap_or(0) as u32,
+                    color_cut: u32_at(data, 37)
+                        .ok()
+                        .map(|value| self.decode_value(value))
+                        .unwrap_or(0),
+                    extension: [
+                        u32_at(data, 41)
+                            .ok()
+                            .map(|value| self.decode_value(value))
+                            .unwrap_or(0),
+                        u32_at(data, 45)
+                            .ok()
+                            .map(|value| self.decode_value(value))
+                            .unwrap_or(0),
+                        u32_at(data, 49)
+                            .ok()
+                            .map(|value| self.decode_value(value))
+                            .unwrap_or(0),
+                        u32_at(data, 53)
+                            .ok()
+                            .map(|value| self.decode_value(value))
+                            .unwrap_or(0),
+                    ],
                 }));
             }
             0x63 => {
@@ -1223,8 +1423,12 @@ impl Vm {
             }
             0x60 => {
                 return Ok(Step::ShowSurface {
+                    effect_kind: self.decode_value(u32_at(&instruction.payload, 0)?),
                     slot: self.decode_value(u32_at(&instruction.payload, 4)?),
                     duration_ms: self.decode_value(u32_at(&instruction.payload, 8)?),
+                    direction: self.decode_value(u32_at(&instruction.payload, 12)?),
+                    parameter: self.decode_value(u32_at(&instruction.payload, 16)?),
+                    mask: c_string(&instruction.payload, 20)?,
                 });
             }
             // EXC is an explicit no-op in the reference implementation.
@@ -1284,11 +1488,37 @@ impl Vm {
                 let _channel = self.decode_value(u32_at(&instruction.payload, 0)?);
                 return Ok(Step::SoundStopped);
             }
+            0x80 => {
+                let id = *instruction.payload.first().ok_or("IM missing cursor id")?;
+                let name = c_string(&instruction.payload, 1)?;
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err("IM has an invalid cursor resource name".into());
+                }
+                self.cursor_resources.insert(id, name);
+            }
             0x81 => {
                 self.cursor_style = *instruction
                     .payload
                     .first()
                     .ok_or("IC missing cursor style")?;
+            }
+            0x82 => {
+                let data = &instruction.payload;
+                let range = MouseRange {
+                    left: self.decode_value(u32_at(data, 0)?),
+                    top: self.decode_value(u32_at(data, 4)?),
+                    right: self.decode_value(u32_at(data, 8)?),
+                    bottom: self.decode_value(u32_at(data, 12)?),
+                };
+                let range = (range.right > range.left && range.bottom > range.top).then_some(range);
+                self.mouse_range = range;
+                return Ok(Step::MouseRange(range));
+            }
+            0x83 => {
+                let x = self.decode_value(u32_at(&instruction.payload, 0)?);
+                let y = self.decode_value(u32_at(&instruction.payload, 4)?);
+                return Ok(Step::MousePosition { x, y });
             }
             0x84 => {
                 let data = &instruction.payload;
@@ -1308,6 +1538,31 @@ impl Vm {
                     },
                 );
             }
+            0x88 => {
+                let index = *instruction.payload.first().ok_or("IHK missing index")?;
+                let mut neighbors = [0; 4];
+                for (direction, value) in instruction.payload[1..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    if direction >= neighbors.len() {
+                        break;
+                    }
+                    let target = self.decode_value(u32::from_le_bytes(*value));
+                    neighbors[direction] = u8::try_from(target).map_err(|_| {
+                        format!("{}: IHK target {target} is out of range", error_context())
+                    })?;
+                }
+                self.key_map.insert(index, neighbors);
+            }
+            0x89 => {
+                let value = self.decode_value(u32_at(&instruction.payload, 0)?);
+                self.key_default = Some(u8::try_from(value).map_err(|_| {
+                    format!("{}: IHKDEF target {value} is out of range", error_context())
+                })?);
+            }
             0x85 => {
                 let selection_register = u16_at(&instruction.payload, 0)?;
                 let button_register = u16_at(&instruction.payload, 2)?;
@@ -1318,32 +1573,38 @@ impl Vm {
                 self.click_pending = false;
             }
             0x86 | 0x87 => self.click_pending = false,
-            // Keyboard mapping and read-text marks are retained for a later
-            // input/skip milestone; they have no branch side effects here.
-            0x88 | 0x89 | 0xA0 => {}
+            // IHK and IHKDEF populate keyboard navigation state above.
+            // Read-text marks do not affect this game's control flow.
+            0xA0 => {}
             0xF4 => {
                 self.popup_enabled = instruction.payload.first() == Some(&1);
             }
             0xF5 => {
                 self.save_enabled = instruction.payload.first() == Some(&1);
             }
-            // Savegame display name; no save UI exists yet.
+            // Script-authored chapter name, retained in quicksaves as well.
             0xF7 => {
                 let bytes = &instruction.payload;
                 let end = bytes
                     .iter()
                     .position(|&byte| byte == 0)
                     .unwrap_or(bytes.len());
-                let (_, _, had_errors) = SHIFT_JIS.decode(&bytes[..end]);
-                if had_errors {
-                    return Err(format!("{}: invalid Shift-JIS save title", error_context()));
-                }
+                self.save_title = Some(
+                    self.translations
+                        .chapters
+                        .get(&TranslationPack::key(&name, instruction.offset))
+                        .cloned()
+                        .unwrap_or(shift_jis_string(&bytes[..end])?),
+                );
             }
             0xF8 => {
-                self.font_style = *instruction
+                let style = *instruction
                     .payload
                     .get(1)
                     .ok_or("SETFONTSTYLE missing style")?;
+                if instruction.payload.first() == Some(&0) {
+                    self.font_style = style;
+                }
             }
             0xF9 => {
                 if instruction.payload.first() == Some(&0) {
@@ -1398,6 +1659,47 @@ impl Vm {
 mod tests {
     use super::*;
 
+    #[test]
+    fn translation_pack_replaces_text_and_choice_without_changing_script() {
+        let mut choice = vec![0; 18];
+        choice[1] = 1;
+        choice.extend_from_slice(b"Original\0");
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x2B, b"\x00\x03\xffOriginal\0\0\0"),
+                    op(1, 0x15, &choice),
+                    op(2, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        vm.set_translations(TranslationPack {
+            pages: HashMap::from([(
+                "TEST:0x0".into(),
+                TextPage {
+                    speaker: None,
+                    body: "中文台词".into(),
+                },
+            )]),
+            choices: HashMap::from([("TEST:0x1".into(), "中文选项".into())]),
+            ..TranslationPack::default()
+        });
+        assert_eq!(
+            vm.step().unwrap(),
+            Step::TextPage(TextPage {
+                speaker: None,
+                body: "中文台词".into(),
+            })
+        );
+        assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+        assert_eq!(vm.choice_options()[0].caption, "中文选项");
+    }
+
     fn script(code_start: usize, jumps: Vec<usize>, instructions: Vec<Instruction>) -> Script {
         Script {
             code_start,
@@ -1412,6 +1714,169 @@ mod tests {
             opcode,
             payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    fn gp_reads_optional_effect_color_cut_and_game_extension_words() {
+        let mut payload = vec![28];
+        for value in [2i32, 0, 0, 640, 480, 1300, 0, 0, 40, 2, 0, 100] {
+            payload.extend((value as u32).to_le_bytes());
+        }
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(0, vec![], vec![op(0, 0x57, &payload), op(1, 0x03, &[])]),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        let Step::Blit(operation) = vm.step().unwrap() else {
+            panic!("expected GP operation");
+        };
+        assert_eq!(operation.command, 28);
+        assert_eq!(operation.effect_color, 40);
+        assert_eq!(operation.color_cut, 2);
+        assert_eq!(operation.extension, [0, 100, 0, 0]);
+    }
+
+    #[test]
+    fn ims_sets_and_clears_mouse_confinement_range() {
+        let mut payload = Vec::new();
+        for value in [20u32, 30, 620, 450] {
+            payload.extend(value.to_le_bytes());
+        }
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x82, &payload),
+                    op(1, 0x82, &[0; 16]),
+                    op(2, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        let expected = MouseRange {
+            left: 20,
+            top: 30,
+            right: 620,
+            bottom: 450,
+        };
+        assert_eq!(vm.step().unwrap(), Step::MouseRange(Some(expected)));
+        assert_eq!(vm.mouse_range(), Some(expected));
+        assert_eq!(vm.step().unwrap(), Step::MouseRange(None));
+        assert_eq!(vm.mouse_range(), None);
+    }
+
+    #[test]
+    fn ixy_decodes_signed_mouse_coordinates() {
+        let mut payload = Vec::new();
+        payload.extend(0x3FFF_FFECu32.to_le_bytes()); // -20
+        payload.extend(0x3FFF_FFF6u32.to_le_bytes()); // -10
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(0, vec![], vec![op(0, 0x83, &payload), op(1, 0x03, &[])]),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        assert_eq!(vm.step().unwrap(), Step::MousePosition { x: -20, y: -10 });
+    }
+
+    #[test]
+    fn gge_exposes_the_mask_and_all_numeric_parameters() {
+        let mut payload = Vec::new();
+        for value in [0u32, 3, 500, 1, 2] {
+            payload.extend(value.to_le_bytes());
+        }
+        payload.extend_from_slice(b"EFF04.BIN\0");
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(0, vec![], vec![op(0, 0x60, &payload), op(1, 0x03, &[])]),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        assert_eq!(
+            vm.step().unwrap(),
+            Step::ShowSurface {
+                slot: 3,
+                duration_ms: 500,
+                effect_kind: 0,
+                direction: 1,
+                parameter: 2,
+                mask: "EFF04.BIN".into()
+            }
+        );
+    }
+
+    #[test]
+    fn im_ic_cursor_registration_and_selection_survive_save_restore() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x80, b"\x00KA_TEXT\0"),
+                    op(1, 0x80, b"\x03KA_CUR\0"),
+                    op(2, 0x81, &[3]),
+                    op(3, 0x81, &[0]),
+                    op(4, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.cursor_style(), 3);
+        assert_eq!(vm.cursor_resource(0), Some("KA_TEXT"));
+        assert_eq!(vm.cursor_resource(3), Some("KA_CUR"));
+        let saved = serde_json::from_value(serde_json::to_value(&vm).unwrap()).unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.cursor_style(), 0);
+        vm.restore(saved).unwrap();
+        assert_eq!(vm.cursor_style(), 3);
+        let mut legacy = serde_json::to_value(&vm).unwrap();
+        legacy.as_object_mut().unwrap().remove("cursor_resources");
+        vm.restore(serde_json::from_value(legacy).unwrap()).unwrap();
+        assert_eq!(vm.cursor_resource(0), Some("KA_TEXT"));
+    }
+
+    #[test]
+    fn font_style_and_shift_jis_save_title_survive_restore() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0xF8, &[0, 5]),
+                    op(1, 0xF8, &[1, 0]),
+                    op(2, 0xF7, &[0x8F, 0x74, 0x89, 0xD4, 0]), // 春花
+                    op(3, 0xF8, &[0, 4]),
+                    op(4, 0xF8, &[0, 0]),
+                    op(5, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.font_style(), 5);
+        vm.step().unwrap();
+        assert_eq!(vm.font_style(), 5, "other windows must not change window 0");
+        vm.step().unwrap();
+        assert_eq!(vm.save_title(), Some("春花"));
+        let saved: Vm = serde_json::from_value(serde_json::to_value(&vm).unwrap()).unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.font_style(), 4);
+        vm.step().unwrap();
+        assert_eq!(vm.font_style(), 0, "normal style clears previous effects");
+        vm.restore(saved).unwrap();
+        assert_eq!(vm.font_style(), 5);
+        assert_eq!(vm.save_title(), Some("春花"));
     }
 
     #[test]
@@ -1684,6 +2149,35 @@ mod tests {
         vm.click();
         assert_eq!(vm.step().unwrap(), Step::ControlFlow);
         assert_eq!(vm.variables.get(&2), Some(&2));
+    }
+
+    #[test]
+    fn mode_one_click_polls_yield_in_story_and_credits_but_not_during_boot() {
+        let input = op(0, 0x85, &[1, 0, 30, 0, 1, 5]);
+        for name in ["SNR00", "STAFF"] {
+            let mut scripts = Scripts::new();
+            scripts.insert(
+                name.into(),
+                script(0, vec![], vec![input.clone(), op(1, 0x00, &[])]),
+            );
+            let mut vm = Vm::new(scripts, name).unwrap();
+            assert!(vm.waiting_for_menu_input(), "{name}");
+            assert_eq!(vm.step().unwrap(), Step::InputPoll, "{name}");
+            assert_eq!(vm.position(), Some((name, 0)));
+            vm.click();
+            assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+            assert_eq!(vm.position(), Some((name, 1)));
+        }
+
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "BGMLOAD".into(),
+            script(0, vec![], vec![input, op(1, 0x00, &[])]),
+        );
+        let mut boot = Vm::new(scripts, "BGMLOAD").unwrap();
+        assert!(!boot.waiting_for_menu_input());
+        assert_eq!(boot.step().unwrap(), Step::ControlFlow);
+        assert_eq!(boot.position(), Some(("BGMLOAD", 1)));
     }
 
     #[test]

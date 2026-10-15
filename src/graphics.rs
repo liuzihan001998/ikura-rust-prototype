@@ -19,11 +19,19 @@ struct Surface {
 
 pub struct Graphics {
     root: PathBuf,
+    localized_root: Option<PathBuf>,
     surfaces: HashMap<i32, Surface>,
     names: HashMap<String, i32>,
 }
 
 impl Graphics {
+    pub fn data_root(&self) -> PathBuf {
+        self.root
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(&self.root)
+            .to_path_buf()
+    }
     pub fn snapshot(&self) -> Result<GraphicsSnapshot, String> {
         let mut surfaces = HashMap::new();
         for (&slot, surface) in &self.surfaces {
@@ -77,6 +85,7 @@ impl Graphics {
                 .parent()
                 .ok_or("graphic bank has no parent")?
                 .join(snapshot.bank),
+            localized_root: self.localized_root.clone(),
             surfaces,
             names: snapshot.names,
         })
@@ -93,9 +102,14 @@ impl Graphics {
         );
         Self {
             root,
+            localized_root: None,
             surfaces,
             names: HashMap::new(),
         }
+    }
+
+    pub fn set_localized_root(&mut self, root: PathBuf) {
+        self.localized_root = Some(root);
     }
 
     /// Slot holding the most recently loaded graphic with this script name.
@@ -140,7 +154,18 @@ impl Graphics {
         } else {
             format!("{name}.GGD.png")
         };
-        let path = self.root.join(file);
+        let path = self
+            .localized_root
+            .as_ref()
+            .filter(|_| self.root.file_name().is_some_and(|bank| bank == "GGD"))
+            .map(|root| {
+                root.join(format!(
+                    "{}.ggd.png",
+                    name.split('.').next().unwrap_or(name)
+                ))
+            })
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| self.root.join(file));
         let image = image::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         let has_alpha = image.color().has_alpha();
         let pixels = DynamicImage::to_rgba8(&image);
@@ -254,6 +279,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn localized_graphic_overrides_original_and_survives_restore() {
+        let root = std::env::temp_dir().join(format!(
+            "ikura-localized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bank = root.join("PNG-images/GGD");
+        let translated = root.join("PNG-images/ggd_sc");
+        std::fs::create_dir_all(&bank).unwrap();
+        std::fs::create_dir_all(&translated).unwrap();
+        RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]))
+            .save(bank.join("T_A.GG2.png"))
+            .unwrap();
+        RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255]))
+            .save(translated.join("T_A.ggd.png"))
+            .unwrap();
+        let mut graphics = Graphics::new(bank, 1, 1);
+        graphics.set_localized_root(translated);
+        graphics.load(1, "T_A.GG2").unwrap();
+        assert_eq!(
+            graphics.surface(1).unwrap().get_pixel(0, 0).0,
+            [0, 255, 0, 255]
+        );
+        let restored = graphics.restored(graphics.snapshot().unwrap()).unwrap();
+        assert_eq!(
+            restored.surface(1).unwrap().get_pixel(0, 0).0,
+            [0, 255, 0, 255]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn basic_blit_copies_and_clips() {
         let mut graphics = Graphics::new(PathBuf::new(), 2, 2);
         graphics.surfaces.insert(
@@ -274,6 +334,9 @@ mod tests {
                 destination: 0,
                 destination_x: 1,
                 destination_y: 1,
+                effect_color: 0,
+                color_cut: 0,
+                extension: [0; 4],
             })
             .unwrap();
         assert_eq!(graphics.screen().get_pixel(1, 1).0, [10, 20, 30, 255]);
@@ -302,6 +365,9 @@ mod tests {
                 destination: 0,
                 destination_x: 0,
                 destination_y: 0,
+                effect_color: 0,
+                color_cut: 0,
+                extension: [0; 4],
             })
             .unwrap();
         assert_eq!(graphics.screen().get_pixel(0, 0).0, [200, 100, 50, 255]);

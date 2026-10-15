@@ -5,6 +5,7 @@
 use crate::vm::ChoiceOption;
 use fontdue::{Font, FontSettings};
 use image::{Rgba, RgbaImage};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,67 @@ const PADDING: i32 = 12;
 const LINE_SPACING: i32 = 2;
 const NAME_GAP: i32 = 6;
 const NAME_SCALE: f32 = 0.85;
+
+fn localize_dynamic_label(text: &str) -> Cow<'_, str> {
+    for (prefix, translated) in [
+        ("SLOT ", "档位 "),
+        ("Slot ", "档位 "),
+        ("Quick: ", "快速存档："),
+        ("Saved: ", "已保存："),
+        ("Loaded: ", "已读取："),
+        ("Deleted: ", "已删除："),
+        ("Delete failed: ", "删除失败："),
+        ("Voice replay failed: ", "语音重播失败："),
+        ("Settings could not be saved: ", "设置保存失败："),
+        ("Could not apply: ", "设置应用失败："),
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return Cow::Owned(format!("{translated}{}", localize_dynamic_label(rest)));
+        }
+    }
+    for (english, translated) in [
+        ("Quick save", "快速存档"),
+        ("Automatic save", "自动存档"),
+        ("Saving...", "正在保存…"),
+        ("Loading...", "正在读取…"),
+        (
+            "Save failed. Check storage space and folder permissions.",
+            "保存失败，请检查磁盘空间和文件夹权限。",
+        ),
+        (" (audio unavailable)", "（音频不可用）"),
+        (" (backup recovered)", "（已从备份恢复）"),
+    ] {
+        if text == english {
+            return Cow::Borrowed(translated);
+        }
+    }
+    for (suffix, translated) in [
+        (" (audio unavailable)", "（音频不可用）"),
+        (" (backup recovered)", "（已从备份恢复）"),
+    ] {
+        if let Some(rest) = text.strip_suffix(suffix) {
+            return Cow::Owned(format!("{}{translated}", localize_dynamic_label(rest)));
+        }
+    }
+    if let Some(rest) = text.strip_suffix("% of script delay") {
+        return Cow::Owned(format!("{}% 剧本速度", rest.trim_end_matches('%')));
+    }
+    if let Some(rest) = text.strip_suffix(" sec + reading time") {
+        return Cow::Owned(format!("{rest} 秒 + 阅读时间"));
+    }
+    if let Some((action, rest)) = text.split_once(' ')
+        && let Some(slot) = rest.strip_suffix('?')
+        && matches!(action, "Delete" | "Overwrite" | "Load")
+    {
+        let action = match action {
+            "Delete" => "删除",
+            "Overwrite" => "覆盖",
+            _ => "读取",
+        };
+        return Cow::Owned(format!("{action} {}？", localize_dynamic_label(slot)));
+    }
+    Cow::Borrowed(text)
+}
 
 /// Geometry and palette for one composed story page.
 pub struct TextWindowLayout {
@@ -24,6 +86,8 @@ pub struct TextWindowLayout {
     /// Height of the text area; 0 grows to fit the page.
     pub height: i32,
     pub font_size: i32,
+    /// F8 bits as used by this game: 0x01 bold and 0x04 black shadow.
+    pub font_style: u8,
     /// Optional original window graphic drawn behind the text.
     pub frame: Option<RgbaImage>,
     /// `SETFONTCOLOR` palette keyed by the font byte from the script.
@@ -33,14 +97,6 @@ pub struct TextWindowLayout {
 impl TextWindowLayout {
     fn body_color(&self) -> [u8; 3] {
         self.colors.get(&0).copied().unwrap_or([255, 255, 255])
-    }
-
-    fn name_color(&self) -> [u8; 3] {
-        self.colors
-            .get(&1)
-            .copied()
-            .or_else(|| self.colors.get(&0).copied())
-            .unwrap_or([255, 255, 255])
     }
 
     fn font_px(&self) -> f32 {
@@ -57,11 +113,112 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
+    /// A clipped, single-line label for menus and notifications.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_label(
+        &self,
+        frame: &mut RgbaImage,
+        text: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        px: f32,
+        color: [u8; 3],
+    ) {
+        let text = if matches!(
+            std::env::var("IKURA_LANG").as_deref(),
+            Ok("zh") | Ok("zh-CN")
+        ) {
+            match text {
+                "SETTINGS" => "设置",
+                "Music volume" => "音乐音量",
+                "Sound volume" => "音效音量",
+                "Voice volume" => "语音音量",
+                "Text delay" => "文字速度",
+                "Auto wait" => "自动播放等待",
+                "Automatic saves" => "自动存档",
+                "Fullscreen" => "全屏",
+                "Instant" => "立即显示",
+                "OFF" => "关闭",
+                "ON" => "开启",
+                "Back" => "返回",
+                "Reset defaults" => "恢复默认",
+                "F10 / Esc: back     Arrow keys: adjust" => "F10 / Esc：返回    方向键：调整",
+                "SAVE GAME" => "保存游戏",
+                "LOAD GAME" => "读取游戏",
+                "Auto" => "自动",
+                "Quick" => "快速",
+                "Save" => "保存",
+                "Load" => "读取",
+                "Delete" => "删除",
+                "Backup" => "备份",
+                "DAMAGED" => "已损坏",
+                "EMPTY" => "空档位",
+                "Confirm" => "确认",
+                "Cancel" => "取消",
+                "Overwrite" => "覆盖",
+                "HISTORY - click a voiced line to replay" => "历史记录 · 点击有语音的台词重播",
+                "No dialogue history yet." => "暂无对话记录。",
+                "Wheel / drag: scroll    Home / End    B / Esc: back" => {
+                    "滚轮 / 拖动：滚动    Home / End    B / Esc：返回"
+                }
+                "Arrows / Enter    PgUp/PgDn    Right click: delete" => {
+                    "方向键 / 回车    PgUp/PgDn    右键：删除"
+                }
+                "Settings F10" => "设置 F10",
+                "Backup only" => "仅有备份",
+                "Different game data" => "游戏数据不匹配",
+                "Damaged save" => "存档已损坏",
+                "This slot is empty." => "此档位为空。",
+                "Saving is disabled at this point." => "当前位置无法存档。",
+                "Quick save: damaged (check backup)" => "快速存档已损坏（请检查备份）",
+                "Quick save: empty" => "快速存档为空",
+                "Save and its recovery backup will be deleted." => "存档和恢复备份将被删除。",
+                "Existing data will be replaced." => "原有存档将被覆盖。",
+                "Unsaved progress will be lost." => "未保存的进度将丢失。",
+                "Settings saved" => "设置已保存",
+                _ => text,
+            }
+        } else {
+            text
+        };
+        let text = if matches!(
+            std::env::var("IKURA_LANG").as_deref(),
+            Ok("zh") | Ok("zh-CN")
+        ) {
+            localize_dynamic_label(text)
+        } else {
+            Cow::Borrowed(text)
+        };
+        self.draw_line(
+            frame,
+            &text,
+            x,
+            y + self.ascent(px).ceil() as i32,
+            width,
+            px,
+            color,
+        );
+    }
     pub fn new() -> Result<Self, String> {
         let candidates: Vec<PathBuf> = if let Some(path) = std::env::var_os("IKURA_FONT") {
             vec![PathBuf::from(path)]
+        } else if matches!(
+            std::env::var("IKURA_LANG").as_deref(),
+            Ok("zh") | Ok("zh-CN")
+        ) {
+            [
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
         } else {
             [
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
                 "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc",
                 "/System/Library/Fonts/Hiragino Sans GB.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -124,14 +281,15 @@ impl TextRenderer {
         if let Some(name) = speaker {
             let name_px = (body_px * NAME_SCALE).max(10.0);
             baseline = area_y + self.ascent(name_px).ceil() as i32;
-            self.draw_line(
+            self.draw_styled_line(
                 &mut frame,
                 name,
                 area_x,
                 baseline,
                 area_w,
                 name_px,
-                layout.name_color(),
+                layout.body_color(),
+                layout.font_style,
             );
             baseline += body_line.max(self.line_height(name_px) + LINE_SPACING) + NAME_GAP;
         }
@@ -145,7 +303,7 @@ impl TextRenderer {
                 }
                 let count = chunk.chars().count();
                 let visible: String = chunk.chars().take(remaining).collect();
-                self.draw_line(
+                self.draw_styled_line(
                     &mut frame,
                     &visible,
                     area_x,
@@ -153,6 +311,7 @@ impl TextRenderer {
                     area_w,
                     body_px,
                     layout.body_color(),
+                    layout.font_style,
                 );
                 remaining = remaining.saturating_sub(count);
                 baseline += body_line;
@@ -304,6 +463,52 @@ impl TextRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn draw_styled_line(
+        &self,
+        frame: &mut RgbaImage,
+        line: &str,
+        x: i32,
+        baseline: i32,
+        max_width: i32,
+        px: f32,
+        color: [u8; 3],
+        style: u8,
+    ) {
+        // Match the reference decoder: bits 0/1 select bold and also enable
+        // its mask shadow; bit 2 enables the same black (2, 2) shadow alone.
+        // The game's actual style bytes are 4 (shadow) and 5 (bold + shadow).
+        let bold = style & 0x03 != 0;
+        if style & 0x07 != 0 {
+            self.draw_line(
+                frame,
+                line,
+                x + 2,
+                baseline + 2,
+                max_width - 2,
+                px,
+                [0, 0, 0],
+            );
+            if bold {
+                self.draw_line(
+                    frame,
+                    line,
+                    x + 3,
+                    baseline + 2,
+                    max_width - 3,
+                    px,
+                    [0, 0, 0],
+                );
+            }
+        }
+        self.draw_line(frame, line, x, baseline, max_width, px, color);
+        if bold {
+            // fontdue has no style switch: synthesize bold with a one-pixel
+            // horizontal stroke while keeping Japanese character advances fixed.
+            self.draw_line(frame, line, x + 1, baseline, max_width - 1, px, color);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_line(
         &self,
         frame: &mut RgbaImage,
@@ -347,7 +552,7 @@ impl TextRenderer {
         }
     }
 
-    fn wrap_line(&self, line: &str, px: f32, max_width: i32) -> Vec<String> {
+    pub(crate) fn wrap_line(&self, line: &str, px: f32, max_width: i32) -> Vec<String> {
         let mut out = Vec::new();
         let mut current = String::new();
         let mut used = 0i32;
@@ -417,9 +622,39 @@ mod tests {
             width: 512,
             height,
             font_size: 20,
+            font_style: 0,
             frame,
             colors: HashMap::from([(0, [255, 240, 220]), (1, [8, 12, 72])]),
         }
+    }
+
+    #[test]
+    fn font_style_adds_shadow_and_bold_without_revealing_future_characters() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let background = RgbaImage::from_pixel(640, 480, Rgba([160, 160, 160, 255]));
+        let mut layout = layout(None, 152);
+        let body = "春花の声が聞こえる。";
+        let plain =
+            renderer.draw_page_revealed(&background, None, body, &layout, usize::MAX, false);
+        layout.font_style = 4;
+        let shadow =
+            renderer.draw_page_revealed(&background, None, body, &layout, usize::MAX, false);
+        assert!(shadow != plain);
+        assert!(
+            shadow.pixels().any(|pixel| pixel[0] < 100),
+            "black shadow over gray background"
+        );
+        layout.font_style = 5;
+        let bold = renderer.draw_page_revealed(&background, None, body, &layout, usize::MAX, false);
+        assert!(bold != shadow);
+        let empty = renderer.draw_page_revealed(&background, None, body, &layout, 0, false);
+        assert!(empty == background, "hidden glyphs must not cast shadows");
+        layout.font_style = 0;
+        let reset =
+            renderer.draw_page_revealed(&background, None, body, &layout, usize::MAX, false);
+        assert!(reset == plain);
     }
 
     #[test]
@@ -629,24 +864,55 @@ mod tests {
     }
 
     #[test]
-    fn name_uses_the_secondary_palette_color() {
+    fn speaker_inherits_text_color_instead_of_unrelated_palette_entries() {
         let Some(renderer) = renderer() else {
             return;
         };
-        let background = RgbaImage::from_pixel(640, 480, Rgba([0, 0, 0, 255]));
-        let graphic = RgbaImage::from_pixel(552, 152, Rgba([64, 64, 64, 255]));
-        let frame =
-            renderer.draw_page(&background, Some("浩一"), "本文", &layout(Some(graphic), 0));
-        let name_color = layout(None, 0).name_color();
-        let matched = (320..472)
-            .flat_map(|y| (44..300).map(move |x| (x, y)))
-            .any(|(x, y)| {
-                let pixel = frame.get_pixel(x as u32, y as u32).0;
-                pixel[..3] != [64, 64, 64] && pixel[2] > pixel[0]
-            });
+        // START defines white text plus dark auxiliary palette entries. A PM
+        // speaker command prints through the same text printer, so index 1
+        // must not turn the speaker's foreground dark blue.
+        let background = RgbaImage::from_pixel(640, 480, Rgba([24, 24, 24, 255]));
+        let mut configured = layout(None, 152);
+        configured.colors.insert(0, [255, 255, 255]);
+        configured.font_style = 5;
+        let actual = renderer.draw_page_revealed(
+            &background,
+            Some("司"),
+            "「……ったく」",
+            &configured,
+            0,
+            false,
+        );
+        let mut alternate = configured;
+        alternate.colors.insert(1, [255, 0, 0]);
+        alternate.colors.insert(2, [0, 255, 0]);
+        let comparison = renderer.draw_page_revealed(
+            &background,
+            Some("司"),
+            "「……ったく」",
+            &alternate,
+            0,
+            false,
+        );
+        assert_eq!(
+            actual, comparison,
+            "auxiliary palette entries changed the speaker foreground"
+        );
         assert!(
-            matched,
-            "expected a blue-tinted speaker name ({name_color:?})"
+            actual.enumerate_pixels().any(|(x, y, p)| x >= 44
+                && (320..360).contains(&y)
+                && p[0] > 220
+                && p[1] > 220
+                && p[2] > 220),
+            "speaker must be legible in the script's white text color even before body reveal"
+        );
+        alternate.colors.insert(0, [255, 210, 120]);
+        let tinted = renderer.draw_page_revealed(&background, Some("司"), "", &alternate, 0, false);
+        assert!(
+            tinted
+                .pixels()
+                .any(|p| p[0] > 220 && p[1] > 180 && p[1] < 220 && p[2] < 150),
+            "speaker must follow a changed primary text color, not a hard-coded white"
         );
     }
 }

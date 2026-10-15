@@ -146,6 +146,7 @@ name = "ikura-rust-prototype"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "flate2",
  "fontdue",
  "image",
  "sdl2",
