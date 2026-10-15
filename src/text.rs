@@ -32,10 +32,7 @@ pub struct TextWindowLayout {
 
 impl TextWindowLayout {
     fn body_color(&self) -> [u8; 3] {
-        self.colors
-            .get(&0)
-            .copied()
-            .unwrap_or([255, 255, 255])
+        self.colors.get(&0).copied().unwrap_or([255, 255, 255])
     }
 
     fn name_color(&self) -> [u8; 3] {
@@ -97,6 +94,21 @@ impl TextRenderer {
         body: &str,
         layout: &TextWindowLayout,
     ) -> RgbaImage {
+        self.draw_page_revealed(background, speaker, body, layout, usize::MAX, true)
+    }
+
+    /// Lay out the full page before revealing glyphs so font fitting and line
+    /// wrapping do not change as the visible prefix grows. Newlines do not
+    /// consume reveal time. Speaker names appear immediately.
+    pub fn draw_page_revealed(
+        &self,
+        background: &RgbaImage,
+        speaker: Option<&str>,
+        body: &str,
+        layout: &TextWindowLayout,
+        visible_chars: usize,
+        show_marker: bool,
+    ) -> RgbaImage {
         let mut frame = background.clone();
         if let Some(graphic) = &layout.frame {
             self.blit_frame(&mut frame, graphic, layout);
@@ -106,7 +118,7 @@ impl TextRenderer {
             return frame;
         }
         let speaker = speaker.filter(|name| !name.is_empty());
-        let body_px = layout.font_px();
+        let body_px = self.fit_font_size(body, speaker.is_some(), area_w, area_h, layout.font_px());
         let body_line = self.line_height(body_px) + LINE_SPACING;
         let mut baseline = area_y + self.ascent(body_px).ceil() as i32;
         if let Some(name) = speaker {
@@ -124,23 +136,30 @@ impl TextRenderer {
             baseline += body_line.max(self.line_height(name_px) + LINE_SPACING) + NAME_GAP;
         }
         let bottom = area_y + area_h;
-        for line in body.split('\n') {
+        let mut remaining = visible_chars;
+        'body: for line in body.split('\n') {
             for chunk in self.wrap_line(line, body_px, area_w) {
                 let glyph_top = baseline - self.ascent(body_px).ceil() as i32;
                 if glyph_top + self.line_height(body_px) > bottom {
-                    return frame;
+                    break 'body;
                 }
+                let count = chunk.chars().count();
+                let visible: String = chunk.chars().take(remaining).collect();
                 self.draw_line(
                     &mut frame,
-                    &chunk,
+                    &visible,
                     area_x,
                     baseline,
                     area_w,
                     body_px,
                     layout.body_color(),
                 );
+                remaining = remaining.saturating_sub(count);
                 baseline += body_line;
             }
+        }
+        if !show_marker || visible_chars < body.chars().filter(|&c| c != '\n').count() {
+            return frame;
         }
         // Click-to-continue marker in the bottom-right corner of the window.
         let marker_x = area_x + area_w - 10;
@@ -151,6 +170,33 @@ impl TextRenderer {
             }
         }
         frame
+    }
+
+    /// Simultaneous dialogue can contain up to five speakers. Keep the script's
+    /// requested size when it fits, and reduce only overflowing pages so the
+    /// final speakers are not silently clipped from the message window.
+    fn fit_font_size(
+        &self,
+        body: &str,
+        speaker: bool,
+        width: i32,
+        height: i32,
+        requested: f32,
+    ) -> f32 {
+        let minimum = requested.min(12.0);
+        let mut px = requested;
+        loop {
+            let lines: usize = body
+                .split('\n')
+                .map(|line| self.wrap_line(line, px, width).len())
+                .sum();
+            let line_height = self.line_height(px) + LINE_SPACING;
+            let header = if speaker { line_height + NAME_GAP } else { 0 };
+            if lines as i32 * line_height + header <= height || px <= minimum {
+                return px;
+            }
+            px = (px - 1.0).max(minimum);
+        }
     }
 
     /// Text area in screen pixels: the scripted window rectangle, clamped to
@@ -247,7 +293,11 @@ impl TextRenderer {
                 baseline,
                 choice.width - 12,
                 px,
-                if hovered { [255, 236, 140] } else { [235, 235, 235] },
+                if hovered {
+                    [255, 236, 140]
+                } else {
+                    [235, 235, 235]
+                },
             );
         }
         frame
@@ -276,7 +326,8 @@ impl TextRenderer {
                 for gx in 0..metrics.width {
                     let dx = cursor + metrics.xmin + gx as i32;
                     let dy = glyph_top + gy as i32;
-                    if dx < 0 || dy < 0 || dx >= frame.width() as i32 || dy >= frame.height() as i32 {
+                    if dx < 0 || dy < 0 || dx >= frame.width() as i32 || dy >= frame.height() as i32
+                    {
                         continue;
                     }
                     let alpha = u16::from(bitmap[gy * metrics.width + gx]);
@@ -301,13 +352,7 @@ impl TextRenderer {
         let mut current = String::new();
         let mut used = 0i32;
         for ch in line.chars() {
-            let advance = self
-                .font
-                .rasterize(ch, px)
-                .0
-                .advance_width
-                .ceil()
-                .max(1.0) as i32;
+            let advance = self.font.rasterize(ch, px).0.advance_width.ceil().max(1.0) as i32;
             if used + advance > max_width && !current.is_empty() {
                 out.push(std::mem::take(&mut current));
                 used = 0;
@@ -331,8 +376,7 @@ impl TextRenderer {
             .map_or((px * 1.35).ceil() as i32, |metrics| {
                 (metrics.ascent - metrics.descent + metrics.line_gap)
                     .ceil()
-                    .max(px)
-                    as i32
+                    .max(px) as i32
             })
     }
 }
@@ -352,10 +396,7 @@ mod font_probe {
             let filled = bitmap.iter().filter(|&&value| value > 0).count();
             println!(
                 "{ch}: advance={:.1} w={} h={} filled={}",
-                metrics.advance_width,
-                metrics.width,
-                metrics.height,
-                filled
+                metrics.advance_width, metrics.width, metrics.height, filled
             );
         }
     }
@@ -382,6 +423,36 @@ mod tests {
     }
 
     #[test]
+    fn reveal_keeps_full_page_layout_and_hides_marker_until_complete() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let background = RgbaImage::from_pixel(640, 480, Rgba([0, 0, 0, 255]));
+        let layout = layout(None, 152);
+        let body = "どうも騙されたようだ。\n春花の声が聞こえる。".repeat(8);
+        let empty = renderer.draw_page_revealed(&background, None, &body, &layout, 0, true);
+        assert!(
+            empty == background,
+            "no glyphs or marker before reveal begins"
+        );
+        let partial = renderer.draw_page_revealed(&background, None, &body, &layout, 8, true);
+        let full =
+            renderer.draw_page_revealed(&background, None, &body, &layout, usize::MAX, false);
+        assert!(partial != empty);
+        assert!(partial != full);
+        for ((shown, complete), untouched) in
+            partial.pixels().zip(full.pixels()).zip(background.pixels())
+        {
+            if shown != untouched {
+                assert_eq!(shown, complete, "revealed glyph moved or changed size");
+            }
+        }
+        let finished =
+            renderer.draw_page_revealed(&background, None, &body, &layout, usize::MAX, true);
+        assert!(finished != full, "finished page has a continue marker");
+    }
+
+    #[test]
     fn page_renders_inside_the_window_frame() {
         let Some(renderer) = renderer() else {
             return;
@@ -404,7 +475,10 @@ mod tests {
             .flat_map(|y| (44..596).map(move |x| (x, y)))
             .filter(|&(x, y)| frame.get_pixel(x as u32, y as u32).0 != [64, 64, 64, 255])
             .count();
-        assert!(changed > 100, "expected glyphs inside the window, got {changed}");
+        assert!(
+            changed > 100,
+            "expected glyphs inside the window, got {changed}"
+        );
     }
 
     #[test]
@@ -420,7 +494,10 @@ mod tests {
             .flat_map(|y| (44..596).map(move |x| (x, y)))
             .filter(|&(x, y)| frame.get_pixel(x as u32, y as u32).0 != [70, 70, 70, 255])
             .count();
-        assert!(changed > 50, "expected body glyphs, got {changed} (color {body:?})");
+        assert!(
+            changed > 50,
+            "expected body glyphs, got {changed} (color {body:?})"
+        );
     }
 
     #[test]
@@ -438,6 +515,26 @@ mod tests {
             .filter(|&(x, y)| frame.get_pixel(x as u32, y as u32).0 != [0, 0, 0, 255])
             .count();
         assert_eq!(rows_below, 0, "text leaked outside the window box");
+    }
+
+    #[test]
+    fn five_speaker_page_fits_before_drawing_the_continue_marker() {
+        let Some(renderer) = renderer() else {
+            return;
+        };
+        let background = RgbaImage::from_pixel(640, 480, Rgba([0, 0, 0, 255]));
+        let mut window = layout(None, 136);
+        window.font_size = 30;
+        let page = "一人目 おかえり\n二人目 おかえりなさい\n三人目 おかえりなさーい\n四人目 おかえり\n五人目 おかえりなさい";
+        let frame = renderer.draw_page(&background, None, page, &window);
+        let (x, y, width, height) = renderer.text_area(&frame, &window);
+        // The marker is reached only if every wrapped line was rendered.
+        assert_eq!(
+            frame
+                .get_pixel((x + width - 10) as u32, (y + height - 10) as u32)
+                .0,
+            [245, 245, 245, 255]
+        );
     }
 
     /// The message box graphic is translucent, so composed text must never be
@@ -525,7 +622,10 @@ mod tests {
             .flat_map(|x| (16..60).map(move |y| (x, y)))
             .filter(|&(x, y)| frame.get_pixel(x, y)[0] > 150)
             .count();
-        assert!(caption_pixels > 40, "expected captions, got {caption_pixels}");
+        assert!(
+            caption_pixels > 40,
+            "expected captions, got {caption_pixels}"
+        );
     }
 
     #[test]
@@ -535,7 +635,8 @@ mod tests {
         };
         let background = RgbaImage::from_pixel(640, 480, Rgba([0, 0, 0, 255]));
         let graphic = RgbaImage::from_pixel(552, 152, Rgba([64, 64, 64, 255]));
-        let frame = renderer.draw_page(&background, Some("浩一"), "本文", &layout(Some(graphic), 0));
+        let frame =
+            renderer.draw_page(&background, Some("浩一"), "本文", &layout(Some(graphic), 0));
         let name_color = layout(None, 0).name_color();
         let matched = (320..472)
             .flat_map(|y| (44..300).map(move |x| (x, y)))
@@ -543,6 +644,9 @@ mod tests {
                 let pixel = frame.get_pixel(x as u32, y as u32).0;
                 pixel[..3] != [64, 64, 64] && pixel[2] > pixel[0]
             });
-        assert!(matched, "expected a blue-tinted speaker name ({name_color:?})");
+        assert!(
+            matched,
+            "expected a blue-tinted speaker name ({name_color:?})"
+        );
     }
 }

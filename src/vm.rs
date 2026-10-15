@@ -1,8 +1,17 @@
 //! Script control flow. ISF byte framing stays in the existing Python parser.
 
 use encoding_rs::SHIFT_JIS;
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+fn serialize_sorted_set<T: Ord + Serialize, S: serde::Serializer>(
+    values: &HashSet<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut values: Vec<_> = values.iter().collect();
+    values.sort_unstable();
+    values.serialize(serializer)
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Instruction {
@@ -20,7 +29,7 @@ pub struct Script {
 
 pub type Scripts = HashMap<String, Script>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HitArea {
     pub index: u8,
     pub x: i32,
@@ -29,7 +38,7 @@ pub struct HitArea {
     pub height: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChoiceOption {
     pub value: u8,
     pub caption: String,
@@ -41,7 +50,7 @@ pub struct ChoiceOption {
 }
 
 /// One decoded `PM` page: an optional speaker name plus the body text.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextPage {
     pub speaker: Option<String>,
     pub body: String,
@@ -57,7 +66,7 @@ impl TextPage {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextWindow {
     pub graphic: Option<String>,
     pub x: i32,
@@ -84,7 +93,7 @@ impl BlitOp {
     /// Transition commands carry their duration in the destination field; all
     /// other blit commands copy immediately.
     pub fn duration(&self) -> i32 {
-        if matches!(self.command, 7 | 19) {
+        if matches!(self.command, 7 | 15..=17 | 19 | 24 | 25 | 28 | 29) {
             self.destination.max(0)
         } else {
             0
@@ -92,7 +101,7 @@ impl BlitOp {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ScriptFrame {
     name: String,
     pc: usize,
@@ -129,6 +138,19 @@ pub enum Step {
         slot: i32,
         duration_ms: i32,
     },
+    Shake {
+        count: u16,
+        x: u8,
+        y: u8,
+        duration_ms: i32,
+    },
+    Scroll {
+        slot: i32,
+        destination: [i32; 4],
+        start: [i32; 2],
+        end: [i32; 2],
+        duration_ms: i32,
+    },
     MusicStopped,
     MusicFade(i32),
     MusicRequested(String),
@@ -155,11 +177,15 @@ pub enum Step {
     Finished,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Vm {
+    #[serde(skip)]
     scripts: Scripts,
     frames: Vec<ScriptFrame>,
     variables: HashMap<u16, i32>,
+    #[serde(serialize_with = "serialize_sorted_set")]
     flags: HashSet<u16>,
+    #[serde(serialize_with = "serialize_sorted_set")]
     system_flags: HashSet<u8>,
     now_ms: u64,
     timer_start_ms: u64,
@@ -176,14 +202,22 @@ pub struct Vm {
     speaker_names: HashMap<u8, String>,
     text_window: TextWindow,
     text_page: Option<TextPage>,
+    multi_text: BTreeMap<u8, TextPage>,
     /// Engine-owned frame counter that scripts poll as `reg 0x1F` (animation
     /// frame index). Scripts never write it; the window advances it once per
     /// rendered frame.
     frame_counter: i32,
     voice_bank: String,
+    #[serde(default)]
+    music_requested: Option<bool>,
     choice_options: Vec<ChoiceOption>,
     choice_selected: Option<u8>,
     waiting_choice: bool,
+    text_visible: bool,
+    #[serde(skip)]
+    skip_key: bool,
+    #[serde(skip)]
+    voice_playing: bool,
 }
 
 fn u16_at(data: &[u8], start: usize) -> Result<u16, String> {
@@ -223,16 +257,21 @@ fn shift_jis_string(data: &[u8]) -> Result<String, String> {
     Ok(decoded.into_owned())
 }
 
-fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<TextPage, String> {
+fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<(TextPage, bool), String> {
     let mut position = 1; // window number
     let mut lines = Vec::new();
     let mut speaker: Option<String> = None;
+    let mut clears_page = false;
     while position < data.len() {
         let command = data[position];
         position += 1;
         match command {
             0 => {}
-            3 => lines.clear(),
+            3 => {
+                lines.clear();
+                speaker = None;
+                clears_page = true;
+            }
             1 => {
                 let subtype = *data.get(position).ok_or("PM color command truncated")?;
                 position += match subtype {
@@ -283,10 +322,13 @@ fn decode_text_page(data: &[u8], names: &HashMap<u8, String>) -> Result<TextPage
             return Err("PM command exceeds payload".into());
         }
     }
-    Ok(TextPage {
-        speaker,
-        body: lines.join("\n"),
-    })
+    Ok((
+        TextPage {
+            speaker,
+            body: lines.join("\n"),
+        },
+        clears_page,
+    ))
 }
 
 impl Vm {
@@ -310,7 +352,7 @@ impl Vm {
             selected: None,
             click_pending: false,
             hit_areas: HashMap::new(),
-            text_interval: 0,
+            text_interval: 25,
             font_size: 0,
             font_style: 0,
             cursor_style: 0,
@@ -320,11 +362,16 @@ impl Vm {
             speaker_names: HashMap::new(),
             text_window: TextWindow::default(),
             text_page: None,
+            multi_text: BTreeMap::new(),
             frame_counter: 0,
             voice_bank: "VOICE2".into(),
+            music_requested: None,
             choice_options: Vec::new(),
             choice_selected: None,
             waiting_choice: false,
+            text_visible: false,
+            skip_key: false,
+            voice_playing: false,
         })
     }
 
@@ -373,6 +420,12 @@ impl Vm {
         self.font_size
     }
 
+    /// PF specifies milliseconds per character; zero displays immediately.
+    /// The initial 25 ms interval matches the reference engine's default.
+    pub fn text_interval_ms(&self) -> u64 {
+        self.text_interval.max(0) as u64
+    }
+
     /// Engine frame counter polled by scripted animations.
     #[cfg(test)]
     pub fn frame_counter(&self) -> i32 {
@@ -391,6 +444,60 @@ impl Vm {
 
     pub fn clear_text_page(&mut self) {
         self.text_page = None;
+    }
+
+    pub fn text_visible(&self) -> bool {
+        self.text_visible
+    }
+
+    pub fn should_restore_music(&self) -> bool {
+        self.music_requested.unwrap_or_else(|| {
+            // Legacy saves lack music_requested. This game's BGMLOAD script
+            // records the current track in register 24 and clears it after MF.
+            // Only apply that compatibility rule when its script is loaded.
+            !(self.scripts.contains_key("BGMLOAD") && self.variables.get(&24) == Some(&0))
+        })
+    }
+    pub fn set_playback_state(&mut self, skip_key: bool, voice_playing: bool) {
+        self.skip_key = skip_key;
+        self.voice_playing = voice_playing;
+    }
+    pub fn can_save(&self) -> bool {
+        let input_poll = self.frames.last().is_some_and(|frame| {
+            self.scripts.get(&frame.name).and_then(|script| {
+                script
+                    .instructions
+                    .binary_search_by_key(&frame.pc, |op| op.offset)
+                    .ok()
+                    .map(|index| script.instructions[index].opcode)
+            }) == Some(0x85)
+        });
+        self.save_enabled && (self.waiting_choice || (input_poll && self.text_page.is_some()))
+    }
+    pub fn restore(&mut self, mut saved: Vm) -> Result<(), String> {
+        if saved.frames.is_empty() {
+            return Err("save has no active script".into());
+        }
+        for frame in &saved.frames {
+            let script = self
+                .scripts
+                .get(&frame.name)
+                .ok_or("saved script is missing")?;
+            for offset in std::iter::once(&frame.pc).chain(&frame.returns) {
+                if script
+                    .instructions
+                    .binary_search_by_key(offset, |op| op.offset)
+                    .is_err()
+                {
+                    return Err(format!("invalid saved address {}:0x{offset:X}", frame.name));
+                }
+            }
+        }
+        saved.click_pending = false;
+        saved.selected = None;
+        saved.scripts = std::mem::take(&mut self.scripts);
+        *self = saved;
+        Ok(())
     }
 
     pub fn waiting_for_choice(&self) -> bool {
@@ -430,19 +537,17 @@ impl Vm {
     }
 
     fn decode_value(&self, raw: u32) -> i32 {
-        let value = if raw & 0x8000_0000 != 0 {
+        if raw & 0x8000_0000 != 0 {
             let index = (raw & 0x7FFF_FFFF) as u16;
             match self.frame_register(index) {
-                Some(value) => value as u32,
-                None => *self.variables.get(&index).unwrap_or(&0) as u32,
+                Some(value) => value,
+                None => *self.variables.get(&index).unwrap_or(&0),
             }
         } else {
-            raw
-        };
-        if value & 0x4000_0000 != 0 {
-            (value | 0x8000_0000) as i32
-        } else {
-            value as i32
+            // This game's immediates are signed 30-bit values: 3FFF_FFFF
+            // is -1 in choice guards; 3FFF_FFEC is -20 in image positions.
+            // Registers already contain decoded signed arithmetic results.
+            ((raw << 2) as i32) >> 2
         }
     }
 
@@ -533,6 +638,7 @@ impl Vm {
                 | 0x56
                 | 0x57
                 | 0x60
+                | 0x62
                 | 0x63
                 | 0x70
                 | 0x71
@@ -604,9 +710,61 @@ impl Vm {
             // a runtime effect. Our variable/flag storage grows dynamically.
             // 0x00 and 0x1A are common window/text-window setup markers used by
             // nearly every scene script, 0x8F and 0xE5 appear in mode scripts,
-            // and 0xD6 stores a speaker display record for the message window.
-            0x00 | 0x13 | 0x1A | 0x23 | 0x30 | 0x40 | 0x48 | 0x49 | 0x80
-            | 0x8F | 0xA1 | 0xA5 | 0xA6 | 0xD6 | 0xE0..=0xE5 => {}
+            0x00
+            | 0x13
+            | 0x1A
+            | 0x23
+            | 0x30
+            | 0x40
+            | 0x48
+            | 0x49
+            | 0x80
+            | 0x8F
+            | 0xA1
+            | 0xA5
+            | 0xA6
+            | 0xE0..=0xE5 => {}
+            0xD6 => {
+                let index = *instruction
+                    .payload
+                    .get(1)
+                    .ok_or("MPM missing record index")?;
+                if index != 0 {
+                    let mut content =
+                        vec![*instruction.payload.first().ok_or("MPM missing window")?];
+                    content.extend_from_slice(&instruction.payload[2..]);
+                    let (page, _) = decode_text_page(&content, &self.speaker_names)?;
+                    self.multi_text.insert(index, page);
+                } else {
+                    if instruction.payload.as_slice() != [0, 0, 3, 0x11, 0] {
+                        return Err(format!(
+                            "{}: unsupported MPM display options",
+                            error_context()
+                        ));
+                    }
+                    if self.multi_text.is_empty() {
+                        return Err("MPM has no buffered dialogue".into());
+                    }
+                    let body = self
+                        .multi_text
+                        .values()
+                        .map(|line| match &line.speaker {
+                            Some(name) => format!("{name} {}", line.body),
+                            None => line.body.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.multi_text.clear();
+                    let page = TextPage {
+                        speaker: None,
+                        body,
+                    };
+                    self.text_page = Some(page.clone());
+                    self.text_visible = true;
+                    self.frame_counter = 0;
+                    return Ok(Step::TextPage(page));
+                }
+            }
             0xF0 => {
                 let kind = *instruction
                     .payload
@@ -678,7 +836,9 @@ impl Vm {
                     height,
                 });
             }
-            0x16 | 0x1B | 0x29 | 0x2A => {}
+            0x16 | 0x1B => {}
+            0x29 => self.text_visible = true,
+            0x2A => self.text_visible = false,
             0x17 => {
                 self.choice_options.clear();
                 self.waiting_choice = false;
@@ -720,12 +880,26 @@ impl Vm {
                 }
             }
             0x2B => {
-                let page = decode_text_page(&instruction.payload, &self.speaker_names)?;
+                let (mut page, clears_page) =
+                    decode_text_page(&instruction.payload, &self.speaker_names)?;
+                if !clears_page && let Some(previous) = &self.text_page {
+                    if page.speaker.is_none() {
+                        page.speaker = previous.speaker.clone();
+                    }
+                    if !previous.body.is_empty() {
+                        page.body = if page.body.is_empty() {
+                            previous.body.clone()
+                        } else {
+                            format!("{}\n{}", previous.body, page.body)
+                        };
+                    }
+                }
                 if page.body.is_empty() && page.speaker.is_none() {
                     self.text_page = None;
                     return Ok(Step::ControlFlow);
                 }
                 self.text_page = Some(page.clone());
+                self.text_visible = true;
                 self.frame_counter = 0;
                 return Ok(Step::TextPage(page));
             }
@@ -864,9 +1038,11 @@ impl Vm {
                     0x08 => {
                         let clicked = self.click_pending;
                         self.click_pending = false;
-                        clicked
+                        clicked || self.skip_key
                     }
-                    0x0A | 0x0C => false,
+                    0x0A => self.skip_key,
+                    // Auto advance is scheduled by the UI's reading timer.
+                    0x0C => false,
                     0x0D => value == 1,
                     _ => self.system_flags.contains(&command) == (value != 0),
                 };
@@ -1017,10 +1193,33 @@ impl Vm {
                     destination_y: read(29)?,
                 }));
             }
-            // Effect/mode command used by scene scripts.
-            0x63 => {}
+            0x63 => {
+                return Ok(Step::Shake {
+                    count: u16_at(&instruction.payload, 0)?,
+                    x: *instruction.payload.get(2).ok_or("GV missing x amplitude")?,
+                    y: *instruction.payload.get(3).ok_or("GV missing y amplitude")?,
+                    duration_ms: self.decode_value(u32_at(&instruction.payload, 4)?),
+                });
+            }
+            0x62 => {
+                let read = |offset| -> Result<i32, String> {
+                    Ok(self.decode_value(u32_at(&instruction.payload, offset)?))
+                };
+                return Ok(Step::Scroll {
+                    slot: read(1)?,
+                    destination: [read(21)?, read(25)?, read(29)?, read(33)?],
+                    start: [read(37)?, read(41)?],
+                    end: [read(45)?, read(49)?],
+                    duration_ms: read(53)?,
+                });
+            }
             0x7E => {
-                // Flag poll: the engine re-checks this flag in a wait loop.
+                let flag = u16_at(&instruction.payload, 1)?;
+                if self.voice_playing {
+                    self.flags.insert(flag);
+                } else {
+                    self.flags.remove(&flag);
+                }
             }
             0x60 => {
                 return Ok(Step::ShowSurface {
@@ -1048,20 +1247,29 @@ impl Vm {
                     .map_err(|_| format!("{}: GO invalid color", error_context()))?;
                 return Ok(Step::FadeTo { duration_ms, color });
             }
-            0x70 => return Ok(Step::MusicRequested(c_string(&instruction.payload, 0)?)),
+            0x70 => {
+                let name = c_string(&instruction.payload, 0)?;
+                self.music_requested = Some(true);
+                return Ok(Step::MusicRequested(name));
+            }
             // The reference engine starts music at ML and treats MP as a no-op.
             0x71 => {}
             0x72 => {
+                self.music_requested = Some(false);
                 return Ok(Step::MusicFade(
                     self.decode_value(u32_at(&instruction.payload, 0)?),
                 ));
             }
-            0x73 => return Ok(Step::MusicStopped),
+            0x73 => {
+                self.music_requested = Some(false);
+                return Ok(Step::MusicStopped);
+            }
             0x74 => return Ok(Step::SoundRequested(c_string(&instruction.payload, 0)?)),
             // SEP is a sound timing hint; the reference decoder has no effect.
             0x75 => {}
             0x76 => {
                 let _channel = self.decode_value(u32_at(&instruction.payload, 0)?);
+                return Ok(Step::SoundStopped);
             }
             // PCMON and PCM cache are explicit no-ops in the reference decoder.
             0x77 | 0x7F => {}
@@ -1207,6 +1415,248 @@ mod tests {
     }
 
     #[test]
+    fn pf_controls_milliseconds_per_character_including_register_values() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEST".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x26, &[0, 0, 0, 0, 0]),
+                    op(1, 0x26, &[0, 1, 0, 0, 0]),
+                    op(2, 0x26, &[0, 7, 0, 0, 128]),
+                    op(3, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        assert_eq!(vm.text_interval_ms(), 25);
+        vm.step().unwrap();
+        assert_eq!(vm.text_interval_ms(), 0);
+        vm.step().unwrap();
+        assert_eq!(vm.text_interval_ms(), 1);
+        vm.variables.insert(7, 80);
+        vm.step().unwrap();
+        assert_eq!(vm.text_interval_ms(), 80);
+    }
+
+    #[test]
+    fn music_fade_and_stop_survive_save_round_trips() {
+        let make_scripts = || {
+            let mut scripts = Scripts::new();
+            scripts.insert(
+                "TEST".into(),
+                script(
+                    0,
+                    vec![],
+                    vec![
+                        op(0, 0x70, b"25.wav\0\x01"),
+                        op(1, 0x72, &1500u32.to_le_bytes()),
+                        op(2, 0x70, b"02.wav\0\x01"),
+                        op(3, 0x73, &[]),
+                        op(4, 0x03, &[]),
+                    ],
+                ),
+            );
+            scripts
+        };
+        let mut vm = Vm::new(make_scripts(), "TEST").unwrap();
+        assert!(matches!(vm.step().unwrap(), Step::MusicRequested(_)));
+        assert!(vm.should_restore_music());
+        assert!(matches!(vm.step().unwrap(), Step::MusicFade(1500)));
+        let saved = serde_json::from_value(serde_json::to_value(&vm).unwrap()).unwrap();
+        let mut restored = Vm::new(make_scripts(), "TEST").unwrap();
+        restored.restore(saved).unwrap();
+        assert!(!restored.should_restore_music());
+        assert!(matches!(restored.step().unwrap(), Step::MusicRequested(_)));
+        assert!(restored.should_restore_music());
+        assert!(matches!(restored.step().unwrap(), Step::MusicStopped));
+        assert!(!restored.should_restore_music());
+    }
+
+    #[test]
+    fn legacy_save_does_not_restart_the_track_cleared_by_bgmload() {
+        let mut scripts = Scripts::new();
+        scripts.insert("BGMLOAD".into(), script(0, vec![], vec![op(0, 0x03, &[])]));
+        let mut vm = Vm::new(scripts, "BGMLOAD").unwrap();
+        vm.variables.insert(24, 0);
+        let mut data = serde_json::to_value(&vm).unwrap();
+        data.as_object_mut().unwrap().remove("music_requested");
+        vm.restore(serde_json::from_value(data).unwrap()).unwrap();
+        assert!(!vm.should_restore_music());
+        vm.variables.insert(24, 16);
+        assert!(vm.should_restore_music());
+    }
+
+    #[test]
+    fn signed_immediates_and_register_results_have_distinct_representations() {
+        let mut scripts = Scripts::new();
+        scripts.insert("TEST".into(), script(0, vec![], vec![op(0, 0x03, &[])]));
+        let mut vm = Vm::new(scripts, "TEST").unwrap();
+        assert_eq!(vm.decode_value(0x3FFF_FFFF), -1);
+        assert_eq!(vm.decode_value(0x3FFF_FFFE), -2);
+        assert_eq!(vm.decode_value(0x3FFF_FFEC), -20);
+        assert_eq!(vm.decode_value(0x2000_0000), -536_870_912);
+        assert_eq!(vm.decode_value(0x1FFF_FFFF), 536_870_911);
+        vm.variables.insert(7, -20);
+        assert_eq!(vm.decode_value(0x8000_0007), -20);
+    }
+
+    #[test]
+    fn window_visibility_voice_flags_and_ctrl_status_follow_runtime_state() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "STATE".into(),
+            script(
+                0,
+                vec![6],
+                vec![
+                    op(0, 0x29, &[0]),
+                    op(1, 0x2A, &[0]),
+                    op(2, 0x7E, &[0, 7, 0]),
+                    op(3, 0x7E, &[0, 7, 0]),
+                    op(4, 0x3A, &[0x0A, 0, 0, 0]),
+                    op(5, 0x03, &[]),
+                    op(6, 0x03, &[]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "STATE").unwrap();
+        assert!(!vm.text_visible());
+        vm.step().unwrap();
+        assert!(vm.text_visible());
+        vm.step().unwrap();
+        assert!(!vm.text_visible());
+        vm.set_playback_state(false, true);
+        vm.step().unwrap();
+        assert!(vm.flags.contains(&7));
+        vm.set_playback_state(true, false);
+        vm.step().unwrap();
+        assert!(!vm.flags.contains(&7));
+        vm.step().unwrap();
+        assert_eq!(vm.position(), Some(("STATE", 6)));
+    }
+
+    #[test]
+    fn save_state_preserves_flags_with_stable_set_ordering() {
+        let mut scripts = Scripts::new();
+        scripts.insert("FLAGS".into(), script(0, vec![], vec![op(0, 0x03, &[])]));
+        let mut vm = Vm::new(scripts, "FLAGS").unwrap();
+        vm.flags.extend([5, 1, 3]);
+        vm.system_flags.extend([14, 0, 8]);
+        let expected = serde_json::to_value(&vm).unwrap();
+        assert_eq!(expected["flags"], serde_json::json!([1, 3, 5]));
+        let saved: Vm = serde_json::from_value(expected.clone()).unwrap();
+        vm.restore(saved).unwrap();
+        assert_eq!(serde_json::to_value(&vm).unwrap(), expected);
+    }
+
+    #[test]
+    fn consecutive_pm_commands_append_until_an_explicit_clear() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEXT".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0x2B, &[0, 3, 4, 1, 0xFF, b'A', 0]),
+                    op(1, 0x2B, &[0, 6, 0xFF, b'B', 0]),
+                    op(2, 0x2B, &[0, 3, 0xFF, b'C', 0]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "TEXT").unwrap();
+        vm.speaker_names.insert(1, "Speaker".into());
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.text_page().unwrap().render(), "Speaker\nA\nB");
+        vm.step().unwrap();
+        assert_eq!(vm.text_page().unwrap().render(), "C");
+    }
+
+    #[test]
+    fn mpm_buffers_speakers_in_index_order_and_clears_each_display_group() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "MULTI".into(),
+            script(
+                0,
+                vec![],
+                vec![
+                    op(0, 0xD6, &[0, 2, 4, 2, 0xFF, b'B', 0]),
+                    op(1, 0xD6, &[0, 1, 4, 1, 0xFF, b'A', 0]),
+                    op(2, 0xD6, &[0, 0, 3, 0x11, 0]),
+                    op(3, 0xD6, &[0, 1, 4, 1, 0xFF, b'C', 0]),
+                    op(4, 0xD6, &[0, 0, 3, 0x11, 0]),
+                    op(5, 0x85, &[1, 0, 2, 0, 1, 4]),
+                ],
+            ),
+        );
+        let mut vm = Vm::new(scripts, "MULTI").unwrap();
+        vm.speaker_names.insert(1, "One".into());
+        vm.speaker_names.insert(2, "Two".into());
+        assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+        assert!(vm.text_page().is_none());
+        vm.step().unwrap();
+        assert_eq!(
+            vm.step().unwrap(),
+            Step::TextPage(TextPage {
+                speaker: None,
+                body: "One A\nTwo B".into()
+            })
+        );
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.text_page().unwrap().body, "One C");
+        assert_eq!(vm.step().unwrap(), Step::InputPoll);
+    }
+
+    #[test]
+    fn choice_status_guard_exits_for_both_zero_and_one() {
+        for value in [0, 1] {
+            let mut scripts = Scripts::new();
+            let condition = vec![14, 0, 0, 0x80, 3, 0xFF, 0xFF, 0xFF, 0x3F, 0, 0, 0, 0xFF];
+            // IF reg14 > -1 jumps to the selected branch's continuation.
+            scripts.insert(
+                "CHOICE".into(),
+                script(
+                    0,
+                    vec![5, 6, 7],
+                    vec![
+                        op(0, 0x16, &[0, 2, 0, 0, 0, 2]),
+                        op(1, 0x18, &[0, 14, 0, 1]),
+                        op(2, 0x18, &[0, 14, 0, 3]),
+                        op(3, 0x47, &condition),
+                        op(4, 0x04, &[0, 0]),
+                        op(5, 0x07, &[14, 0, 0, 0x80, 2, 1, 0, 2, 0]),
+                        op(6, 0x03, &[]),
+                        op(7, 0x03, &[]),
+                    ],
+                ),
+            );
+            let mut vm = Vm::new(scripts, "CHOICE").unwrap();
+            vm.choice_options = vec![ChoiceOption {
+                value,
+                caption: "choice".into(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }];
+            assert_eq!(vm.step().unwrap(), Step::ChoicePoll);
+            vm.choose(value).unwrap();
+            for _ in 0..4 {
+                vm.step().unwrap();
+            }
+            assert_eq!(vm.position(), Some(("CHOICE", 5)));
+            vm.step().unwrap();
+            assert_eq!(vm.position(), Some(("CHOICE", 6 + usize::from(value))));
+        }
+    }
+
+    #[test]
     fn text_page_waits_for_click_and_decodes_shift_jis() {
         let (encoded, _, _) = SHIFT_JIS.encode("どうも騙されたようだ。");
         let mut payload = vec![0, 3, 0xFF];
@@ -1260,7 +1710,11 @@ mod tests {
         vm.step().unwrap();
         assert_eq!(vm.variables.get(&7), Some(&1));
         assert_eq!(vm.step().unwrap(), Step::Yield);
-        assert_eq!(vm.variables.get(&9), Some(&20), "20ms frame advanced the clock");
+        assert_eq!(
+            vm.variables.get(&9),
+            Some(&20),
+            "20ms frame advanced the clock"
+        );
     }
 
     #[test]
@@ -1284,10 +1738,48 @@ mod tests {
             ),
         );
         let mut vm = Vm::new(scripts, "SNR00").unwrap();
-        for _ in 0..8 {
+        for _ in 0..3 {
+            assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+        }
+        assert_eq!(
+            vm.step().unwrap(),
+            Step::Shake {
+                count: 2,
+                x: 5,
+                y: 0,
+                duration_ms: 100
+            }
+        );
+        for _ in 0..4 {
             assert_eq!(vm.step().unwrap(), Step::ControlFlow);
         }
         assert_eq!(vm.position(), None);
+    }
+
+    #[test]
+    fn scroll_decodes_viewport_offsets_and_duration() {
+        let mut payload = vec![0];
+        for value in [
+            2u32, 1280, 960, 0, 0, 10, 20, 640, 480, 0, 0, 640, 480, 1500,
+        ] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "SCROLL".into(),
+            script(0, vec![], vec![op(0, 0x62, &payload)]),
+        );
+        let mut vm = Vm::new(scripts, "SCROLL").unwrap();
+        assert_eq!(
+            vm.step().unwrap(),
+            Step::Scroll {
+                slot: 2,
+                destination: [10, 20, 640, 480],
+                start: [0, 0],
+                end: [640, 480],
+                duration_ms: 1500,
+            }
+        );
     }
 
     #[test]

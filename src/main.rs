@@ -1,4 +1,5 @@
 mod graphics;
+mod save;
 mod text;
 mod video;
 mod vm;
@@ -6,7 +7,7 @@ mod vm;
 use graphics::Graphics;
 use image::RgbaImage;
 use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Scancode};
 use sdl2::mixer::{self, AUDIO_S16SYS, Channel, Chunk, InitFlag, Music, Sdl2MixerContext};
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::{Color, PixelFormatEnum};
@@ -24,6 +25,48 @@ use vm::{Instruction, Scripts, Step, Vm};
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
+fn should_advance(
+    auto_mode: bool,
+    skip: bool,
+    voice_playing: bool,
+    elapsed: Duration,
+    delay: Duration,
+) -> bool {
+    (skip && elapsed >= Duration::from_millis(40))
+        || (auto_mode && !voice_playing && elapsed >= delay)
+}
+
+#[derive(Default)]
+struct DialogueReveal {
+    completed: bool,
+    rendered: Option<(usize, bool)>,
+}
+
+impl DialogueReveal {
+    fn visible(&self, total: usize, interval_ms: u64, elapsed: Duration) -> usize {
+        if self.completed || interval_ms == 0 {
+            total
+        } else {
+            (elapsed.as_millis() / u128::from(interval_ms)).min(total as u128) as usize
+        }
+    }
+
+    /// The first click completes the text without advancing the VM or audio.
+    fn consume_click(&mut self, total: usize, interval_ms: u64, elapsed: Duration) -> bool {
+        if self.visible(total, interval_ms, elapsed) < total {
+            self.completed = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn dialogue_chars(vm: &Vm) -> usize {
+    vm.text_page()
+        .map_or(0, |page| page.body.chars().filter(|&ch| ch != '\n').count())
+}
+
 struct VideoUi {
     _sdl: sdl2::Sdl,
     canvas: Canvas<Window>,
@@ -33,6 +76,8 @@ struct VideoUi {
     music: Option<Music<'static>>,
     sounds: HashMap<String, Chunk>,
     voice: Option<Chunk>,
+    music_path: Option<PathBuf>,
+    voice_path: Option<PathBuf>,
     quit_requested: bool,
 }
 
@@ -66,6 +111,8 @@ impl VideoUi {
             music: None,
             sounds: HashMap::new(),
             voice: None,
+            music_path: None,
+            voice_path: None,
             quit_requested: false,
         })
     }
@@ -79,6 +126,7 @@ impl VideoUi {
             return Err(format!("SDL_mixer did not start {}", path.display()).into());
         }
         self.music = Some(music);
+        self.music_path = Some(path.to_path_buf());
         Ok(())
     }
 
@@ -113,6 +161,7 @@ impl VideoUi {
         self.stop_voice();
         self.voice = Some(Chunk::from_file(path)?);
         Channel(0).play(self.voice.as_ref().ok_or("voice load failed")?, 0)?;
+        self.voice_path = Some(path.to_path_buf());
         Ok(())
     }
 
@@ -121,6 +170,16 @@ impl VideoUi {
             Channel(0).halt();
         }
         self.voice = None;
+        self.voice_path = None;
+    }
+
+    fn voice_playing(&self) -> bool {
+        self.mixer_context.is_some() && Channel(0).is_playing()
+    }
+
+    fn skip_held(&self) -> bool {
+        let keys = self.events.keyboard_state();
+        keys.is_scancode_pressed(Scancode::LCtrl) || keys.is_scancode_pressed(Scancode::RCtrl)
     }
 
     fn stop_music(&mut self) {
@@ -128,12 +187,20 @@ impl VideoUi {
             Music::halt();
         }
         self.music = None;
+        self.music_path = None;
     }
 
     fn fade_music(&mut self, duration_ms: i32) -> Result<(), Box<dyn Error>> {
-        if self.music.is_some() && Music::is_playing() {
-            Music::fade_out(duration_ms.max(0))?;
+        if duration_ms <= 0 {
+            self.stop_music();
+            return Ok(());
         }
+        if self.music.is_some() && Music::is_playing() {
+            Music::fade_out(duration_ms)?;
+        }
+        // A fading track must not be saved as an indefinitely looping song.
+        // Leave the Music handle alive while SDL finishes the fade.
+        self.music_path = None;
         Ok(())
     }
 }
@@ -211,9 +278,7 @@ fn draw(
     canvas.set_draw_color(Color::BLACK);
     canvas.clear();
     canvas.copy(if preview { background } else { title }, None, None)?;
-    if !preview
-        && let Some(index) = hover
-    {
+    if !preview && let Some(index) = hover {
         canvas.set_draw_color(Color::RGB(255, 225, 30));
         if let Some(area) = menu_rect(vm, index) {
             canvas.draw_rect(area)?;
@@ -287,14 +352,34 @@ enum FrameGraphic {
     Loaded(RgbaImage),
 }
 
-/// One timed graphical transition (`GO` fade or a `GP` command that carries a
-/// duration). The VM applies the final frame immediately, so the transition
-/// cross-fades the captured before/after surfaces over the scripted time.
+/// A timed effect over captured surfaces. The VM keeps the final frame while
+/// presentation renders the intermediate frames without baking them into VRAM.
 struct Transition {
     from: RgbaImage,
     to: RgbaImage,
     duration: Duration,
     elapsed: Duration,
+    effect: TransitionEffect,
+}
+
+enum TransitionEffect {
+    Fade,
+    Blinds {
+        vertical: bool,
+        stripe: u32,
+    },
+    Wipe,
+    Shake {
+        count: u16,
+        x: u8,
+        y: u8,
+    },
+    Scroll {
+        source: RgbaImage,
+        destination: [i32; 4],
+        start: [i32; 2],
+        end: [i32; 2],
+    },
 }
 
 impl Transition {
@@ -304,6 +389,7 @@ impl Transition {
             to,
             duration: Duration::from_millis(duration_ms.max(0) as u64),
             elapsed: Duration::ZERO,
+            effect: TransitionEffect::Fade,
         }
     }
 
@@ -320,8 +406,211 @@ impl Transition {
     }
 
     fn frame(&self) -> RgbaImage {
-        blend_frames(&self.from, &self.to, self.progress())
+        let progress = self.progress();
+        if progress >= 1.0 {
+            return self.to.clone();
+        }
+        match &self.effect {
+            TransitionEffect::Fade => blend_frames(&self.from, &self.to, progress),
+            TransitionEffect::Blinds { vertical, stripe } => {
+                let mut frame = self.from.clone();
+                for (x, y, pixel) in frame.enumerate_pixels_mut() {
+                    let axis = if *vertical { x } else { y };
+                    if f64::from(axis % stripe) < f64::from(*stripe) * progress {
+                        *pixel = *self.to.get_pixel(x, y);
+                    }
+                }
+                frame
+            }
+            TransitionEffect::Wipe => {
+                let mut frame = self.from.clone();
+                let edge = (f64::from(frame.width()) * progress) as u32;
+                for y in 0..frame.height() {
+                    for x in 0..edge {
+                        frame.put_pixel(x, y, *self.to.get_pixel(x, y));
+                    }
+                }
+                frame
+            }
+            TransitionEffect::Shake { count, x, y } => {
+                let phase = progress * f64::from(*count) * std::f64::consts::TAU;
+                let dx = (phase.sin() * f64::from(*x)).round() as i32;
+                let dy = (phase.sin() * f64::from(*y)).round() as i32;
+                let mut frame = RgbaImage::from_pixel(
+                    self.from.width(),
+                    self.from.height(),
+                    image::Rgba([0, 0, 0, 255]),
+                );
+                for (x, y, pixel) in self.from.enumerate_pixels() {
+                    let tx = x as i32 + dx;
+                    let ty = y as i32 + dy;
+                    if tx >= 0 && ty >= 0 && tx < frame.width() as i32 && ty < frame.height() as i32
+                    {
+                        frame.put_pixel(tx as u32, ty as u32, *pixel);
+                    }
+                }
+                frame
+            }
+            TransitionEffect::Scroll {
+                source,
+                destination,
+                start,
+                end,
+            } => {
+                let mut frame = self.from.clone();
+                let sx =
+                    (f64::from(start[0]) + f64::from(end[0] - start[0]) * progress).round() as i32;
+                let sy =
+                    (f64::from(start[1]) + f64::from(end[1] - start[1]) * progress).round() as i32;
+                for y in 0..destination[3].max(0) {
+                    for x in 0..destination[2].max(0) {
+                        let dx = destination[0] + x;
+                        let dy = destination[1] + y;
+                        if dx >= 0
+                            && dy >= 0
+                            && dx < frame.width() as i32
+                            && dy < frame.height() as i32
+                            && sx + x >= 0
+                            && sy + y >= 0
+                            && sx + x < source.width() as i32
+                            && sy + y < source.height() as i32
+                        {
+                            frame.put_pixel(
+                                dx as u32,
+                                dy as u32,
+                                *source.get_pixel((sx + x) as u32, (sy + y) as u32),
+                            );
+                        }
+                    }
+                }
+                frame
+            }
+        }
     }
+}
+
+/// Run each scripted effect before fetching the next instruction. Event pumping
+/// keeps close/skip responsive and prevents later effects replacing earlier ones.
+fn play_transition(
+    ui: &mut VideoUi,
+    vm: &mut Vm,
+    mut effect: Transition,
+) -> Result<(), Box<dyn Error>> {
+    let creator = ui.canvas.texture_creator();
+    let started = std::time::Instant::now();
+    let mut previous = started;
+    loop {
+        for event in ui.events.poll_iter() {
+            match event {
+                Event::Quit { .. } => {
+                    ui.quit_requested = true;
+                    return Ok(());
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                }
+                | Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    effect.elapsed = effect.duration;
+                }
+                _ => {}
+            }
+        }
+        if ui.skip_held() {
+            effect.elapsed = effect.duration;
+        }
+        let now = std::time::Instant::now();
+        let delta = now.duration_since(previous);
+        previous = now;
+        let finished = effect.advance(delta);
+        vm.advance_clock(delta.as_millis() as u64);
+        vm.tick_frame();
+        let texture = texture_from_rgba(&creator, &effect.frame())?;
+        ui.canvas.clear();
+        ui.canvas.copy(&texture, None, None)?;
+        ui.canvas.present();
+        if finished {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
+
+fn dispatch_transition(
+    ui: &mut Option<&mut VideoUi>,
+    vm: &mut Vm,
+    pending: &mut Option<Transition>,
+    effect: Transition,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(ui) = ui.as_deref_mut() {
+        play_transition(ui, vm, effect)?;
+    } else {
+        vm.advance_clock(effect.duration.as_millis() as u64);
+        *pending = Some(effect);
+    }
+    Ok(())
+}
+
+fn demo_animations(data_dir: &Path, ui: &mut VideoUi, vm: &mut Vm) -> Result<(), Box<dyn Error>> {
+    let root = data_dir.join("PNG-images/GGD");
+    let from = image::open(root.join("BG01AC.GG0.png"))?.to_rgba8();
+    let to = image::open(root.join("BG32AC.GG0.png"))?.to_rgba8();
+    let mut strip = RgbaImage::new(from.width() * 3, from.height() * 6);
+    let mut wide = RgbaImage::new(from.width() * 2, from.height());
+    image::imageops::replace(&mut wide, &from, 0, 0);
+    image::imageops::replace(&mut wide, &to, i64::from(from.width()), 0);
+    for (row, kind) in [
+        TransitionEffect::Fade,
+        TransitionEffect::Blinds {
+            vertical: false,
+            stripe: 16,
+        },
+        TransitionEffect::Blinds {
+            vertical: true,
+            stripe: 16,
+        },
+        TransitionEffect::Wipe,
+        TransitionEffect::Shake {
+            count: 3,
+            x: 12,
+            y: 5,
+        },
+        TransitionEffect::Scroll {
+            source: wide,
+            destination: [0, 0, from.width() as i32, from.height() as i32],
+            start: [0, 0],
+            end: [from.width() as i32, 0],
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let final_frame = if row == 4 { from.clone() } else { to.clone() };
+        let mut effect = Transition::new(from.clone(), final_frame, 700);
+        effect.effect = kind;
+        for (column, ms) in [175, 350, 525].into_iter().enumerate() {
+            effect.elapsed = Duration::from_millis(ms);
+            image::imageops::replace(
+                &mut strip,
+                &effect.frame(),
+                (column as u32 * from.width()) as i64,
+                (row as u32 * from.height()) as i64,
+            );
+        }
+        effect.elapsed = Duration::ZERO;
+        play_transition(ui, vm, effect)?;
+        if ui.quit_requested {
+            return Ok(());
+        }
+    }
+    if let Some(path) = std::env::var_os("IKURA_DUMP_ANIMATION") {
+        strip.save(path)?;
+    }
+    println!("Animation demo completed: fade, horizontal/vertical blinds, wipe, shake, scroll");
+    Ok(())
 }
 
 /// Why the runner stopped.
@@ -331,6 +620,9 @@ enum RunOutcome {
     Reached,
     /// The step budget ran out while the script was waiting for external state.
     Stalled,
+    /// Bytecode/graphics operation has no implementation; the probe must fail.
+    Unsupported,
+    Finished,
 }
 
 /// A running transition plus the composed frame to show once it lands.
@@ -462,14 +754,8 @@ fn pump_frames_until_stable(
             break;
         }
         vm.tick_frame();
-        let (next, outcome) = run_until_input_or_story(
-            vm,
-            graphics,
-            data_dir,
-            true,
-            Some(ui),
-            false,
-        )?;
+        let (next, outcome) =
+            run_until_input_or_story(vm, graphics, data_dir, true, Some(ui), false)?;
         if next.is_some() {
             transition = next;
         }
@@ -490,13 +776,25 @@ fn run_until_input_or_story(
     mut ui: Option<&mut VideoUi>,
     stop_at_story: bool,
 ) -> Result<(Option<Transition>, RunOutcome), Box<dyn Error>> {
-    let mut page_seen = false;
     let mut transition = None;
     let mut history: Vec<(String, usize)> = Vec::new();
     let mut last_cycle: Option<usize> = None;
     let mut repeats = 0u32;
-    for _ in 0..STEP_BUDGET {
-        let (script, offset) = vm.position().ok_or("VM finished unexpectedly")?;
+    for step_index in 0..STEP_BUDGET {
+        if ui.as_ref().is_some_and(|ui| ui.quit_requested) {
+            return Ok((transition, RunOutcome::Reached));
+        }
+        if let Some(ui) = ui.as_deref_mut() {
+            // A held Ctrl can run many opcodes before the outer event loop.
+            // Refresh keyboard state so releasing it stops fast-forward promptly.
+            if step_index % 64 == 0 {
+                ui.events.pump_events();
+            }
+            vm.set_playback_state(ui.skip_held(), ui.voice_playing());
+        }
+        let Some((script, offset)) = vm.position() else {
+            return Ok((transition, RunOutcome::Finished));
+        };
         if (stop_at_story && script == "SNR00") || (script == "TITLE" && offset == 0x7B9) {
             return Ok((transition, RunOutcome::Reached));
         }
@@ -544,25 +842,80 @@ fn run_until_input_or_story(
                     "VM {position}: GO fade {duration_ms}ms to #{:02X}{:02X}{:02X}",
                     color[0], color[1], color[2]
                 );
-                if transition.is_none() && duration_ms > 0 {
-                    transition = Some(Transition::new(
-                        before,
-                        graphics.screen().clone(),
-                        duration_ms,
-                    ));
+                if duration_ms > 0 {
+                    dispatch_transition(
+                        &mut ui,
+                        vm,
+                        &mut transition,
+                        Transition::new(before, graphics.screen().clone(), duration_ms),
+                    )?;
                 }
             }
             Step::ShowSurface { slot, duration_ms } => {
                 let before = graphics.screen().clone();
                 graphics.show_surface(slot)?;
                 println!("VM {position}: GGE slot={slot} final frame ({duration_ms}ms)");
-                if transition.is_none() && duration_ms > 0 {
-                    transition = Some(Transition::new(
-                        before,
-                        graphics.screen().clone(),
-                        duration_ms,
-                    ));
+                if duration_ms > 0 {
+                    dispatch_transition(
+                        &mut ui,
+                        vm,
+                        &mut transition,
+                        Transition::new(before, graphics.screen().clone(), duration_ms),
+                    )?;
                 }
+            }
+            Step::Shake {
+                count,
+                x,
+                y,
+                duration_ms,
+            } => {
+                let screen = graphics.screen().clone();
+                let total = duration_ms.max(0).saturating_mul(i32::from(count));
+                let mut effect = Transition::new(screen.clone(), screen, total);
+                effect.effect = TransitionEffect::Shake { count, x, y };
+                dispatch_transition(&mut ui, vm, &mut transition, effect)?;
+            }
+            Step::Scroll {
+                slot,
+                destination,
+                mut start,
+                mut end,
+                duration_ms,
+            } => {
+                let source = graphics
+                    .surface(slot)
+                    .ok_or("GSCRL source surface missing")?
+                    .clone();
+                if destination[2] <= 0 || destination[3] <= 0 {
+                    return Err("GSCRL viewport must have positive dimensions".into());
+                }
+                let max_x = (source.width() as i32 - destination[2]).max(0);
+                let max_y = (source.height() as i32 - destination[3]).max(0);
+                for point in [&mut start, &mut end] {
+                    point[0] = point[0].clamp(0, max_x);
+                    point[1] = point[1].clamp(0, max_y);
+                }
+                let before = graphics.screen().clone();
+                graphics.blit(&vm::BlitOp {
+                    command: 0,
+                    source: slot,
+                    source_x: end[0],
+                    source_y: end[1],
+                    width: destination[2],
+                    height: destination[3],
+                    destination: 0,
+                    destination_x: destination[0],
+                    destination_y: destination[1],
+                })?;
+                let mut effect = Transition::new(before, graphics.screen().clone(), duration_ms);
+                effect.effect = TransitionEffect::Scroll {
+                    source,
+                    destination,
+                    start,
+                    end,
+                };
+                dispatch_transition(&mut ui, vm, &mut transition, effect)?;
             }
             Step::MusicStopped => {
                 if let Some(ui) = ui.as_deref_mut() {
@@ -631,29 +984,39 @@ fn run_until_input_or_story(
                 }
             }
             Step::GraphicBank(bank) => graphics.set_bank(&bank)?,
-            Step::TextPage(page) => {
-                match &page.speaker {
-                    Some(speaker) => println!("VM {position}: PM {speaker}: {}", page.body),
-                    None => println!("VM {position}: PM text: {}", page.body),
-                }
-                if page_seen {
-                    return Ok((transition, RunOutcome::Reached));
-                }
-                page_seen = true;
-            }
+            Step::TextPage(page) => match &page.speaker {
+                Some(speaker) => println!("VM {position}: PM {speaker}: {}", page.body),
+                None => println!("VM {position}: PM text: {}", page.body),
+            },
             Step::InputPoll | Step::ChoicePoll => return Ok((transition, RunOutcome::Reached)),
             Step::Blit(operation) => {
+                if matches!(operation.command, 24 | 25 | 28 | 29) {
+                    println!(
+                        "VM {position}: GP {} uses cross-fade approximation; extended effect parameters are pending",
+                        operation.command
+                    );
+                }
                 let before = graphics.screen().clone();
                 if let Err(error) = graphics.blit(&operation) {
                     println!("VM paused at {position}: {error}");
-                    return Ok((transition, RunOutcome::Reached));
+                    return Ok((transition, RunOutcome::Unsupported));
                 }
-                if transition.is_none() && operation.duration() > 0 {
-                    transition = Some(Transition::new(
-                        before,
-                        graphics.screen().clone(),
-                        operation.duration(),
-                    ));
+                if operation.duration() > 0 {
+                    let mut effect =
+                        Transition::new(before, graphics.screen().clone(), operation.duration());
+                    effect.effect = match operation.command {
+                        15 => TransitionEffect::Blinds {
+                            vertical: false,
+                            stripe: 16,
+                        },
+                        16 => TransitionEffect::Blinds {
+                            vertical: true,
+                            stripe: 16,
+                        },
+                        17 => TransitionEffect::Wipe,
+                        _ => TransitionEffect::Fade,
+                    };
+                    dispatch_transition(&mut ui, vm, &mut transition, effect)?;
                 }
             }
             Step::InitSurface {
@@ -684,16 +1047,22 @@ fn run_until_input_or_story(
             }
             Step::Unsupported { opcode, .. } => {
                 println!("VM paused at {position}: opcode 0x{opcode:02X} is not implemented yet");
-                return Ok((transition, RunOutcome::Reached));
+                return Ok((transition, RunOutcome::Unsupported));
             }
-            Step::Yield => vm.advance_clock(16),
+            Step::Yield => {
+                vm.advance_clock(16);
+                // A timer poll is making progress even if its PC cycles.
+                history.clear();
+                last_cycle = None;
+                repeats = 0;
+            }
             Step::Wait(milliseconds) => {
                 if ui.is_some() {
                     std::thread::sleep(Duration::from_millis(milliseconds));
                 }
                 vm.advance_clock(milliseconds);
             }
-            Step::Finished => return Ok((transition, RunOutcome::Reached)),
+            Step::Finished => return Ok((transition, RunOutcome::Finished)),
             Step::ControlFlow => {}
         }
     }
@@ -712,9 +1081,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let script_path = PathBuf::from(args.next().unwrap_or_else(|| "data/scripts.json".into()));
     let mode = args.next();
-    let probe_story = mode.as_deref() == Some("--probe-story");
+    let probe_save = mode.as_deref() == Some("--probe-save");
+    let probe_story = probe_save || mode.as_deref() == Some("--probe-story");
     let probe_start = probe_story || mode.as_deref() == Some("--probe-start");
-    let scripts: Scripts = serde_json::from_slice(&std::fs::read(&script_path)?)?;
+    let script_bytes = std::fs::read(&script_path)?;
+    let script_signature = save::script_signature(&script_bytes);
+    let scripts: Scripts = serde_json::from_slice(&script_bytes)?;
+    let quicksave_path = std::env::var_os("IKURA_SAVE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("rust-saves"))
+        .join("quicksave.json");
     let start = scripts.get("START").ok_or("START script missing")?;
     let title_script = scripts.get("TITLE").ok_or("TITLE script missing")?;
 
@@ -745,6 +1121,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         Some(VideoUi::new()?)
     };
+    if mode.as_deref() == Some("--demo-animation") {
+        demo_animations(
+            &data_dir,
+            video_ui.as_mut().ok_or("SDL window missing")?,
+            &mut vm,
+        )?;
+        return Ok(());
+    }
     // Begin at START's real code_start. The VM executes initialization,
     // video playback, and title loading without jumping over setup code. The
     // boot scripts poll frame counters, so hand out frames until the title
@@ -759,7 +1143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             video_ui.as_mut(),
             true,
         )?;
-        if outcome == RunOutcome::Reached || boot_frames >= BOOT_FRAME_BUDGET {
+        if outcome != RunOutcome::Stalled || boot_frames >= BOOT_FRAME_BUDGET {
             break transition;
         }
         boot_frames += 1;
@@ -793,7 +1177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 None,
                 !probe_story,
             )?;
-            if outcome == RunOutcome::Reached || boot_frames >= BOOT_FRAME_BUDGET {
+            if outcome != RunOutcome::Stalled || boot_frames >= BOOT_FRAME_BUDGET {
                 break;
             }
             boot_frames += 1;
@@ -805,6 +1189,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .text_page()
                 .ok_or("story probe did not reach a text page")?;
             println!("First story page: {}", page.render());
+            let save_probe = if probe_save {
+                let path = std::env::var_os("IKURA_PROBE_SAVE_OUTPUT")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::temp_dir()
+                            .join(format!("ikura-real-save-probe-{}.json", std::process::id()))
+                    });
+                save::write(
+                    &path,
+                    script_signature,
+                    &vm,
+                    &graphics,
+                    save::AudioState::default(),
+                )?;
+                Some((path, serde_json::to_value(&vm)?, graphics.screen().clone()))
+            } else {
+                None
+            };
             if let Some(path) = std::env::var_os("IKURA_DUMP_STORY") {
                 let mut story = StoryFrame::new();
                 let layout = story.layout(&graphics, &data_dir, &vm);
@@ -820,7 +1222,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(3)
-                .clamp(1, 1000);
+                .clamp(1, 100_000);
             let choice_value = std::env::var("IKURA_PROBE_CHOICE")
                 .ok()
                 .and_then(|value| value.parse::<u8>().ok())
@@ -831,13 +1233,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap_or(0);
             let mut frames_left = frame_budget;
             let mut page_count = 1;
+            let mut stop_reason = "page_limit";
             while page_count < page_limit {
                 if vm.waiting_for_choice() {
                     println!("Story choices: {:?}", vm.choice_options());
                     if let Some(path) = std::env::var_os("IKURA_DUMP_CHOICE") {
                         let renderer = TextRenderer::new()?;
                         renderer
-                            .draw_choices(graphics.screen(), vm.choice_options(), Some(choice_value))
+                            .draw_choices(
+                                graphics.screen(),
+                                vm.choice_options(),
+                                Some(choice_value),
+                            )
                             .save(path)?;
                     }
                     vm.choose(choice_value)?;
@@ -862,7 +1269,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                         vm.tick_frame();
                         continue;
                     }
-                    println!("Story probe stalled at {:?}", vm.position());
+                    return Err(format!(
+                        "Story probe stalled after {page_count} pages at {:?}",
+                        vm.position()
+                    )
+                    .into());
+                }
+                if outcome == RunOutcome::Unsupported {
+                    return Err(format!(
+                        "Story probe hit an unsupported operation after {page_count} pages at {:?}",
+                        vm.position()
+                    )
+                    .into());
+                }
+                if outcome == RunOutcome::Finished {
+                    stop_reason = "finished";
                     break;
                 }
                 if vm.waiting_for_choice() {
@@ -872,8 +1293,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                     page_count += 1;
                 } else {
                     println!("Story probe paused at {:?}", vm.position());
+                    stop_reason = "no_text_boundary";
                     break;
                 }
+            }
+            println!(
+                "Story probe summary: pages={page_count} reason={stop_reason} position={:?}",
+                vm.position()
+            );
+            if let Some((path, expected_vm, expected_screen)) = save_probe {
+                save::read(&path, script_signature, &mut vm, &mut graphics)?;
+                let actual_vm = serde_json::to_value(&vm)?;
+                let restored = actual_vm == expected_vm && graphics.screen() == &expected_screen;
+                if std::env::var_os("IKURA_PROBE_SAVE_OUTPUT").is_none() {
+                    std::fs::remove_file(path)?;
+                }
+                if !restored {
+                    if let Some(fields) = expected_vm.as_object() {
+                        for (key, value) in fields {
+                            if actual_vm.get(key) != Some(value) {
+                                eprintln!("Save mismatch in VM field: {key}");
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "Save screen pixels restored: {}",
+                        graphics.screen() == &expected_screen
+                    );
+                    return Err("save probe did not restore the original state and screen".into());
+                }
+                println!(
+                    "Save probe restored the original VM state and screen at {:?}",
+                    vm.position()
+                );
             }
         }
         return Ok(());
@@ -889,23 +1341,191 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut story_frame = StoryFrame::new();
     let mut choosing = false;
     let mut choice_hover: Option<u8> = None;
-    let mut next_transition = transition
-        .take()
-        .map(|transition| PendingTransition {
-            transition,
-            final_frame: graphics.screen().clone(),
-        });
+    let mut auto_mode = false;
+    let mut dialogue_hidden = false;
+    let mut page_started = std::time::Instant::now();
+    let mut reveal_started = page_started;
+    let mut reveal = DialogueReveal::default();
+    let mut next_transition = transition.take().map(|transition| PendingTransition {
+        transition,
+        final_frame: graphics.screen().clone(),
+    });
 
     'running: loop {
-        let pending_events: Vec<_> = if next_transition.is_some() {
+        let mut pending_events: Vec<_> = if next_transition.is_some() {
             // Keep animating while still handling input between frames.
             ui.events.poll_iter().collect()
         } else {
             ui.events.wait_timeout_iter(16).collect()
         };
+        let auto_delay = vm.text_page().map_or(1500, |page| {
+            (800 + page.body.chars().count() as u64 * 55).clamp(1500, 8000)
+        }) + dialogue_chars(&vm) as u64 * vm.text_interval_ms();
+        let advance = preview
+            && !choosing
+            && !dialogue_hidden
+            && vm.text_visible()
+            && next_transition.is_none()
+            && should_advance(
+                auto_mode,
+                ui.skip_held(),
+                ui.voice_playing(),
+                page_started.elapsed(),
+                Duration::from_millis(auto_delay),
+            );
+        if advance && pending_events.is_empty() {
+            pending_events.push(Event::MouseButtonDown {
+                timestamp: 0,
+                window_id: ui.canvas.window().id(),
+                which: 0,
+                mouse_btn: MouseButton::Left,
+                clicks: 1,
+                x: 0,
+                y: 0,
+            });
+        }
         for event in pending_events {
+            let event = match event {
+                Event::KeyDown {
+                    keycode: Some(Keycode::Space | Keycode::Return),
+                    repeat: false,
+                    ..
+                } if preview && !choosing => Event::MouseButtonDown {
+                    timestamp: 0,
+                    window_id: ui.canvas.window().id(),
+                    which: 0,
+                    mouse_btn: MouseButton::Left,
+                    clicks: 1,
+                    x: 0,
+                    y: 0,
+                },
+                Event::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } if !preview && menu_at(&vm, x, y) == Some(1) => Event::KeyDown {
+                    timestamp: 0,
+                    window_id: ui.canvas.window().id(),
+                    keycode: Some(Keycode::F9),
+                    scancode: None,
+                    keymod: sdl2::keyboard::Mod::NOMOD,
+                    repeat: false,
+                },
+                event => event,
+            };
             match event {
                 Event::Quit { .. } => break 'running,
+                Event::KeyDown {
+                    keycode: Some(Keycode::A),
+                    repeat: false,
+                    ..
+                } if preview && !choosing => {
+                    auto_mode = !auto_mode;
+                    page_started = std::time::Instant::now();
+                    ui.canvas.window_mut().set_title(if auto_mode {
+                        "Kazoku Keikaku - AUTO (A to stop)"
+                    } else {
+                        "Kazoku Keikaku - manual"
+                    })?;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::H),
+                    repeat: false,
+                    ..
+                }
+                | Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } if preview && !choosing => {
+                    dialogue_hidden = !dialogue_hidden;
+                    page_started = std::time::Instant::now();
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F5),
+                    repeat: false,
+                    ..
+                } if preview && next_transition.is_none() => {
+                    let audio = save::AudioState {
+                        music: if ui.mixer_context.is_some() && Music::is_playing() {
+                            ui.music_path.clone()
+                        } else {
+                            None
+                        },
+                        voice: if ui.voice_playing() {
+                            ui.voice_path.clone()
+                        } else {
+                            None
+                        },
+                    };
+                    match save::write(&quicksave_path, script_signature, &vm, &graphics, audio) {
+                        Ok(()) => {
+                            println!("Quick save: {}", quicksave_path.display());
+                            ui.canvas
+                                .window_mut()
+                                .set_title("Kazoku Keikaku - quick save stored")?;
+                        }
+                        Err(error) => {
+                            eprintln!("Quick save failed: {error}");
+                            ui.canvas
+                                .window_mut()
+                                .set_title("Quick save failed - see console")?;
+                        }
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F9),
+                    repeat: false,
+                    ..
+                } => match save::read(&quicksave_path, script_signature, &mut vm, &mut graphics) {
+                    Ok(audio) => {
+                        ui.stop_music();
+                        ui.stop_sound();
+                        ui.stop_voice();
+                        if let Some(path) = audio.music.filter(|_| vm.should_restore_music()) {
+                            ui.start_music(&path)?;
+                        }
+                        if let Some(path) = audio.voice {
+                            ui.play_voice(&path)?;
+                        }
+                        preview = true;
+                        choosing = vm.waiting_for_choice();
+                        choice_hover = None;
+                        auto_mode = false;
+                        dialogue_hidden = false;
+                        next_transition = None;
+                        page_started = std::time::Instant::now();
+                        reveal_started = page_started;
+                        reveal = DialogueReveal {
+                            completed: true,
+                            rendered: None,
+                        };
+                        story_frame = StoryFrame::new();
+                        let renderer = TextRenderer::new()?;
+                        let mut frame = graphics.screen().clone();
+                        if let Some(page) = vm.text_page() {
+                            let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                            frame = renderer.draw_page(
+                                &frame,
+                                page.speaker.as_deref(),
+                                &page.body,
+                                &layout,
+                            );
+                        }
+                        text_renderer = Some(renderer);
+                        background = texture_from_rgba(&creator, &frame)?;
+                        println!("Quick load: {:?}", vm.position());
+                        ui.canvas
+                            .window_mut()
+                            .set_title("Kazoku Keikaku - quick save restored")?;
+                    }
+                    Err(error) => {
+                        eprintln!("Quick load failed: {error}");
+                        ui.canvas
+                            .window_mut()
+                            .set_title("Quick load failed - see console")?;
+                    }
+                },
                 Event::KeyDown {
                     keycode: Some(Keycode::Escape),
                     ..
@@ -927,6 +1547,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ..
                 } if choosing => {
                     if let Some(value) = choice_at(&vm, x, y) {
+                        auto_mode = false;
+                        ui.stop_voice();
                         vm.choose(value)?;
                         println!("Choice {value} selected");
                         let (story_transition, outcome) = run_until_input_or_story(
@@ -949,6 +1571,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                             break 'running;
                         }
                         choosing = vm.waiting_for_choice();
+                        page_started = std::time::Instant::now();
+                        reveal_started = page_started;
+                        reveal = DialogueReveal::default();
                         choice_hover = None;
                         let mut frame = graphics.screen().clone();
                         if let (Some(page), Some(renderer)) =
@@ -984,6 +1609,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(index) = menu_at(&vm, x, y) {
                         if index == 3 {
                             break 'running;
+                        }
+                        if index == 0 {
+                            // TITLE clears its BGM registers before LS SNR00,
+                            // but that branch contains no standalone MS/MF.
+                            // End the menu track when starting a new game so
+                            // the unvoiced opening cannot inherit title music.
+                            ui.stop_music();
+                            println!("Title -> new game: stopped title music");
                         }
                         vm.set_selected(Some(index as i16));
                         // Consume the pending IG, then execute its script branch.
@@ -1029,6 +1662,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         println!("Menu choice {index}: VM position {:?}", vm.position());
                         choosing = vm.waiting_for_choice();
+                        page_started = std::time::Instant::now();
+                        reveal_started = page_started;
+                        reveal = DialogueReveal::default();
                         if choosing {
                             vm.clear_text_page();
                         }
@@ -1046,6 +1682,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                     mouse_btn: MouseButton::Left,
                     ..
                 } if preview => {
+                    if dialogue_hidden {
+                        dialogue_hidden = false;
+                        page_started = std::time::Instant::now();
+                        continue;
+                    }
+                    if !ui.skip_held()
+                        && reveal.consume_click(
+                            dialogue_chars(&vm),
+                            vm.text_interval_ms(),
+                            reveal_started.elapsed(),
+                        )
+                    {
+                        // Completing the visible sentence must keep its voice
+                        // playing and leave the pending IG untouched.
+                        page_started = std::time::Instant::now();
+                        continue;
+                    }
+                    // Advancing ends the current line even when the next page
+                    // is unvoiced or the script starts a scene transition.
+                    // Do this before running the VM so PCMGETPOS sees it too.
+                    ui.stop_voice();
                     vm.clear_text_page();
                     vm.click();
                     let (story_transition, outcome) = run_until_input_or_story(
@@ -1069,6 +1726,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     choosing = vm.waiting_for_choice();
                     if choosing {
+                        auto_mode = false;
+                    }
+                    page_started = std::time::Instant::now();
+                    reveal_started = page_started;
+                    reveal = DialogueReveal::default();
+                    if choosing {
                         vm.clear_text_page();
                     }
                     if ui.quit_requested {
@@ -1077,8 +1740,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let mut frame = graphics.screen().clone();
                     if let (Some(page), Some(renderer)) = (vm.text_page(), &text_renderer) {
                         let layout = story_frame.layout(&graphics, &data_dir, &vm);
-                        frame =
-                            renderer.draw_page(graphics.screen(), page.speaker.as_deref(), &page.body, &layout);
+                        frame = renderer.draw_page(
+                            graphics.screen(),
+                            page.speaker.as_deref(),
+                            &page.body,
+                            &layout,
+                        );
                     } else {
                         ui.canvas
                             .window_mut()
@@ -1109,10 +1776,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // translucent, so text baked in here would show through the
                 // next page's box as ghosting.
                 next_transition = None;
+                reveal_started = std::time::Instant::now();
+                page_started = reveal_started;
+                reveal = DialogueReveal::default();
             }
         }
         vm.tick_frame();
-        if choosing && !vm.choice_options().is_empty() {
+        if preview
+            && !choosing
+            && next_transition.is_none()
+            && (dialogue_hidden || !vm.text_visible())
+        {
+            let scene = texture_from_rgba(&creator, graphics.screen())?;
+            draw(&mut ui.canvas, &title, &scene, preview, hover, &vm)?;
+        } else if choosing && !vm.choice_options().is_empty() {
             let frame = TextRenderer::new()?.draw_choices(
                 graphics.screen(),
                 vm.choice_options(),
@@ -1120,6 +1797,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
             let overlay = texture_from_rgba(&creator, &frame)?;
             draw(&mut ui.canvas, &title, &overlay, preview, hover, &vm)?;
+        } else if preview && next_transition.is_none() && vm.text_page().is_some() {
+            let total = dialogue_chars(&vm);
+            if ui.skip_held() {
+                reveal.completed = true;
+            }
+            let visible = reveal.visible(total, vm.text_interval_ms(), reveal_started.elapsed());
+            let marker =
+                visible == total && (reveal_started.elapsed().as_millis() / 500).is_multiple_of(2);
+            if reveal.rendered != Some((visible, marker)) {
+                if let (Some(page), Some(renderer)) = (vm.text_page(), text_renderer.as_ref()) {
+                    let layout = story_frame.layout(&graphics, &data_dir, &vm);
+                    let frame = renderer.draw_page_revealed(
+                        graphics.screen(),
+                        page.speaker.as_deref(),
+                        &page.body,
+                        &layout,
+                        visible,
+                        marker,
+                    );
+                    background = texture_from_rgba(&creator, &frame)?;
+                }
+                reveal.rendered = Some((visible, marker));
+            }
+            draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
         } else {
             draw(&mut ui.canvas, &title, &background, preview, hover, &vm)?;
         }
@@ -1140,10 +1841,55 @@ mod tests {
     }
 
     #[test]
+    fn dialogue_click_completes_before_it_advances_and_zero_interval_is_instant() {
+        let mut reveal = DialogueReveal::default();
+        let total = "春花\n「こんにちは」"
+            .chars()
+            .filter(|&c| c != '\n')
+            .count();
+        let elapsed = Duration::from_millis(75);
+        assert_eq!(reveal.visible(total, 25, elapsed), 3);
+        assert!(reveal.consume_click(total, 25, elapsed));
+        assert_eq!(reveal.visible(total, 25, elapsed), total);
+        assert!(!reveal.consume_click(total, 25, elapsed));
+        let mut instant = DialogueReveal::default();
+        assert_eq!(instant.visible(total, 0, Duration::ZERO), total);
+        assert!(!instant.consume_click(total, 0, Duration::ZERO));
+        assert_eq!(instant.visible(total, 25, Duration::from_secs(20)), total);
+    }
+
+    #[test]
+    fn auto_waits_for_voice_and_reading_delay_while_skip_can_interrupt_voice() {
+        let elapsed = Duration::from_secs(2);
+        let delay = Duration::from_millis(1500);
+        assert!(should_advance(true, false, false, elapsed, delay));
+        assert!(!should_advance(true, false, true, elapsed, delay));
+        assert!(!should_advance(
+            true,
+            false,
+            false,
+            Duration::from_millis(500),
+            delay
+        ));
+        assert!(should_advance(false, true, true, elapsed, delay));
+        assert!(!should_advance(
+            false,
+            true,
+            false,
+            Duration::from_millis(10),
+            delay
+        ));
+        assert!(!should_advance(false, false, false, elapsed, delay));
+    }
+
+    #[test]
     fn blend_frames_interpolates_between_the_captured_states() {
         let from = image([0, 0, 0, 255]);
         let to = image([200, 100, 50, 255]);
-        assert_eq!(blend_frames(&from, &to, 0.0).get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(
+            blend_frames(&from, &to, 0.0).get_pixel(0, 0).0,
+            [0, 0, 0, 255]
+        );
         assert_eq!(
             blend_frames(&from, &to, 1.0).get_pixel(0, 0).0,
             [200, 100, 50, 255]
@@ -1156,7 +1902,8 @@ mod tests {
 
     #[test]
     fn transition_progress_runs_from_zero_to_complete() {
-        let mut transition = Transition::new(image([0, 0, 0, 255]), image([255, 255, 255, 255]), 100);
+        let mut transition =
+            Transition::new(image([0, 0, 0, 255]), image([255, 255, 255, 255]), 100);
         assert_eq!(transition.progress(), 0.0);
         assert!(!transition.advance(Duration::from_millis(50)));
         assert!((transition.progress() - 0.5).abs() < 0.01);
@@ -1169,6 +1916,137 @@ mod tests {
         let transition = Transition::new(image([0, 0, 0, 255]), image([1, 2, 3, 255]), 0);
         assert_eq!(transition.progress(), 1.0);
         assert_eq!(transition.frame().get_pixel(0, 0).0, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn runner_settles_consecutive_text_blocks_at_the_actual_input_poll() {
+        let mut scripts = Scripts::new();
+        scripts.insert(
+            "TEXT".into(),
+            vm::Script {
+                code_start: 0,
+                jumps: vec![],
+                instructions: vec![
+                    Instruction {
+                        offset: 0,
+                        opcode: 0x2B,
+                        payload: vec![0, 3, 0xFF, b'A', 0],
+                    },
+                    Instruction {
+                        offset: 1,
+                        opcode: 0x2B,
+                        payload: vec![0, 6, 0xFF, b'B', 0],
+                    },
+                    Instruction {
+                        offset: 2,
+                        opcode: 0x86,
+                        payload: vec![],
+                    },
+                    Instruction {
+                        offset: 3,
+                        opcode: 0x85,
+                        payload: vec![1, 0, 2, 0, 1, 4],
+                    },
+                ],
+            },
+        );
+        let mut vm = Vm::new(scripts, "TEXT").unwrap();
+        let mut graphics = Graphics::new(PathBuf::new(), 1, 1);
+        let (_, result) =
+            run_until_input_or_story(&mut vm, &mut graphics, Path::new(""), false, None, false)
+                .unwrap();
+        assert_eq!(result, RunOutcome::Reached);
+        assert_eq!(vm.position(), Some(("TEXT", 3)));
+        assert_eq!(vm.text_page().unwrap().body, "A\nB");
+        vm.click();
+        assert_eq!(vm.step().unwrap(), Step::ControlFlow);
+    }
+
+    #[test]
+    fn runner_distinguishes_unsupported_bytecode_from_normal_completion() {
+        for (opcode, expected) in [
+            (0xFF, RunOutcome::Unsupported),
+            (0x03, RunOutcome::Finished),
+        ] {
+            let mut scripts = Scripts::new();
+            scripts.insert(
+                "END".into(),
+                vm::Script {
+                    code_start: 0,
+                    jumps: vec![],
+                    instructions: vec![Instruction {
+                        offset: 0,
+                        opcode,
+                        payload: vec![],
+                    }],
+                },
+            );
+            let mut vm = Vm::new(scripts, "END").unwrap();
+            let mut graphics = Graphics::new(PathBuf::new(), 1, 1);
+            let (_, outcome) =
+                run_until_input_or_story(&mut vm, &mut graphics, Path::new(""), false, None, false)
+                    .unwrap();
+            assert_eq!(outcome, expected);
+            if expected == RunOutcome::Unsupported {
+                assert_eq!(vm.position(), Some(("END", 0)));
+            }
+        }
+    }
+
+    #[test]
+    fn blinds_reveal_stripes_then_land_on_the_exact_final_frame() {
+        let from = RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 255]));
+        let to = RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]));
+        for vertical in [false, true] {
+            let mut effect = Transition::new(from.clone(), to.clone(), 100);
+            effect.effect = TransitionEffect::Blinds {
+                vertical,
+                stripe: 4,
+            };
+            effect.advance(Duration::from_millis(50));
+            let frame = effect.frame();
+            assert_eq!(frame.pixels().filter(|pixel| pixel[0] == 255).count(), 32);
+            assert_ne!(
+                frame.get_pixel(0, 0),
+                frame.get_pixel(if vertical { 2 } else { 0 }, if vertical { 0 } else { 2 })
+            );
+            effect.advance(Duration::from_millis(50));
+            assert_eq!(effect.frame(), to);
+        }
+    }
+
+    #[test]
+    fn shake_moves_pixels_without_modifying_the_persistent_screen() {
+        let mut screen = RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 255]));
+        screen.put_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let mut effect = Transition::new(screen.clone(), screen.clone(), 100);
+        effect.effect = TransitionEffect::Shake {
+            count: 1,
+            x: 2,
+            y: 1,
+        };
+        effect.advance(Duration::from_millis(25));
+        assert_eq!(effect.frame().get_pixel(4, 3)[0], 255);
+        effect.advance(Duration::from_millis(75));
+        assert_eq!(effect.frame(), screen);
+    }
+
+    #[test]
+    fn scroll_samples_the_intermediate_viewport_and_restores_the_final_frame() {
+        let source = RgbaImage::from_fn(8, 2, |x, _| image::Rgba([x as u8, 0, 0, 255]));
+        let before = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        let after = RgbaImage::from_fn(2, 2, |x, _| *source.get_pixel(x + 6, 0));
+        let mut effect = Transition::new(before, after.clone(), 100);
+        effect.effect = TransitionEffect::Scroll {
+            source,
+            destination: [0, 0, 2, 2],
+            start: [0, 0],
+            end: [6, 0],
+        };
+        effect.advance(Duration::from_millis(50));
+        assert_eq!(effect.frame().get_pixel(0, 0)[0], 3);
+        effect.advance(Duration::from_millis(50));
+        assert_eq!(effect.frame(), after);
     }
 
     fn empty_scripts() -> Scripts {

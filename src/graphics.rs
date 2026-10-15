@@ -1,7 +1,16 @@
 use crate::vm::BlitOp;
 use image::{DynamicImage, Rgba, RgbaImage};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::PathBuf;
+
+#[derive(Serialize, Deserialize)]
+pub struct GraphicsSnapshot {
+    bank: String,
+    surfaces: HashMap<i32, (bool, Vec<u8>)>,
+    names: HashMap<String, i32>,
+}
 
 struct Surface {
     pixels: RgbaImage,
@@ -15,6 +24,64 @@ pub struct Graphics {
 }
 
 impl Graphics {
+    pub fn snapshot(&self) -> Result<GraphicsSnapshot, String> {
+        let mut surfaces = HashMap::new();
+        for (&slot, surface) in &self.surfaces {
+            let mut png = Cursor::new(Vec::new());
+            surface
+                .pixels
+                .write_to(&mut png, image::ImageFormat::Png)
+                .map_err(|error| error.to_string())?;
+            surfaces.insert(slot, (surface.has_alpha, png.into_inner()));
+        }
+        Ok(GraphicsSnapshot {
+            bank: self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("invalid graphic bank")?
+                .into(),
+            surfaces,
+            names: self.names.clone(),
+        })
+    }
+
+    pub fn restored(&self, snapshot: GraphicsSnapshot) -> Result<Self, String> {
+        if !matches!(snapshot.bank.as_str(), "GGD" | "GGD2") || snapshot.surfaces.len() > 64 {
+            return Err("invalid saved graphics configuration".into());
+        }
+        let mut surfaces = HashMap::new();
+        for (slot, (has_alpha, bytes)) in snapshot.surfaces {
+            let pixels = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                .map_err(|error| error.to_string())?
+                .to_rgba8();
+            if pixels.width() > 4096 || pixels.height() > 4096 {
+                return Err("saved surface is too large".into());
+            }
+            surfaces.insert(slot, Surface { pixels, has_alpha });
+        }
+        let screen = surfaces.get(&0).ok_or("save has no screen surface")?;
+        if screen.pixels.dimensions() != self.screen().dimensions() {
+            return Err("saved screen dimensions differ".into());
+        }
+        if snapshot
+            .names
+            .values()
+            .any(|slot| !surfaces.contains_key(slot))
+        {
+            return Err("save references a missing surface".into());
+        }
+        Ok(Self {
+            root: self
+                .root
+                .parent()
+                .ok_or("graphic bank has no parent")?
+                .join(snapshot.bank),
+            surfaces,
+            names: snapshot.names,
+        })
+    }
+
     pub fn new(root: PathBuf, width: u32, height: u32) -> Self {
         let mut surfaces = HashMap::new();
         surfaces.insert(
@@ -124,6 +191,10 @@ impl Graphics {
             // The destination field is a duration for transition commands.
             7 | 19 => (0, true),
             15..=17 => (0, false),
+            // These script-specific effects use the same target rectangle and
+            // duration layout. Preserve their final image; presentation uses
+            // an explicitly labelled cross-fade approximation.
+            24 | 25 | 28 | 29 => (0, false),
             command => return Err(format!("GP command {command} is not implemented")),
         };
         let source = self
