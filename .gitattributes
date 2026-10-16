@@ -1,0 +1,3 @@
+# Exclude bundled third-party SDL code from GitHub language statistics.
+android/native/SDL2_mixer/** linguist-vendored
+android/app/src/main/java/org/libsdl/app/** linguist-vendored
