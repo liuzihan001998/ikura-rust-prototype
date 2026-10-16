@@ -1,0 +1,53 @@
+plugins {
+    id "com.android.application"
+}
+
+def workspaceRoot = rootProject.projectDir.parentFile
+
+android {
+    namespace "com.ikura.familyplan"
+    compileSdk 35
+    ndkVersion "27.2.12479018"
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId "com.ikura.familyplan"
+        minSdk 24
+        targetSdk 35
+        versionCode 4
+        versionName "0.1.3"
+        ndk { abiFilters "arm64-v8a" }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["src/main/jniLibs"]
+        }
+    }
+
+    androidResources {
+        noCompress += ["zip"]
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+tasks.register("buildRustAndroid", Exec) {
+    workingDir workspaceRoot
+    commandLine "bash", "tools/build_android.sh"
+}
+
+tasks.named("preBuild").configure {
+    dependsOn("buildRustAndroid")
+    doFirst {
+        if (!file("src/main/assets/ikura-data.zip").isFile()) {
+            throw new GradleException("Missing src/main/assets/ikura-data.zip. Run tools/stage_android_assets.sh first.")
+        }
+    }
+}

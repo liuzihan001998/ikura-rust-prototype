@@ -427,3 +427,93 @@ SDL_AUDIODRIVER=dummy cargo run -- /Users/a1/Desktop/dev/ikura/game_data data/sc
 
 The check verifies independent volumes, history replay on a separate channel,
 pausing/resuming the story voice, and seeking saved music/voice positions.
+
+## Windows、macOS 和 Android
+
+游戏逻辑和资源格式由同一份 Rust 代码处理。macOS/Linux 通过 pkg-config 查找 SDL2 和
+SDL2_mixer；Windows 通过 vcpkg 查找。Windows 开发环境需要 Rust、Visual Studio C++
+Build Tools、vcpkg、SDL2、SDL2_mixer、FFmpeg，并设置 `VCPKG_ROOT`。macOS 使用 Homebrew：
+
+```sh
+brew install sdl2 sdl2_mixer ffmpeg pkg-config
+cargo run -- /path/to/game_data
+```
+
+Android 工程位于 `android/`，目前目标架构为 arm64-v8a。它会把资源装入 APK，首次启动时
+解压到应用私有目录。先用原版游戏目录和解包目录生成资源包，再构建 APK：
+
+```sh
+tools/stage_android_assets.sh /path/to/original-game /path/to/game_data
+cd android
+./gradlew assembleDebug
+```
+
+APK 输出到 `android/app/build/outputs/apk/debug/app-debug.apk`。本机需要 Android SDK、NDK
+27.2.12479018、CMake 3.22.1、JDK 21 和 Rust 的 `aarch64-linux-android` target；Gradle
+任务会自动编译 Rust、SDL2 和 SDL2_mixer。`tools/build_android.sh` 可以单独重建 JNI 库。
+Android 跳过启动片头，也不使用 ffmpeg 外部解码；游戏 VM、图片和音频播放继续使用同一份实现。
+
+
+## macOS Apple Silicon GitHub 测试版
+
+macOS 发布工具位于 `tools/package_macos.py`，应用启动器位于
+`packaging/macos/Launcher.swift`。发布包只包含解释器和运行依赖；游戏数据由使用者自己准备。
+完整安装与数据目录说明见 `packaging/macos/README.zh-CN.md`。
+
+本机构建（Apple Silicon，Xcode 命令行工具、Rust、Python 3.9+、Homebrew）：
+
+```sh
+brew install pkg-config sdl2 sdl2_mixer ffmpeg
+python3 tools/package_macos.py --version 0.1.0-alpha.1
+python3 tools/verify_macos_bundle.py dist/macos-v0.1.0-alpha.1-arm64/Ikura.app
+```
+
+输出到 `dist/macos-v0.1.0-alpha.1-arm64/`：
+
+- `Ikura.app`：可双击启动，首次选择已准备好的 `game_data`。
+- `Ikura-v0.1.0-alpha.1-macos-arm64.zip` 和同名 `.dmg`：用于上传 Release。
+- `SHA256SUMS`：两个安装包的 SHA-256 校验值。
+- `RELEASE_NOTES.md`：本次版本、源码提交、实际最低 macOS 要求。
+- `README.zh-CN.md`：安装、数据准备、操作和已知限制。
+
+打包工具递归收集 SDL、媒体工具及其动态库，修正其加载路径，并补齐 SDL2 兼容层
+通过 `dlopen` 加载的 SDL3。所有 Mach-O 文件只保留 arm64，先签名依赖，再签名应用。
+第三方组件信息、原有授权文本及构建配方一起放入包内。当前为临时签名的测试包，
+未配置 Apple Developer ID 签名或公证。
+
+最低系统版本取所有内置二进制部署版本的最大值。本机如果安装了仅支持较新 macOS 的
+Homebrew 依赖，生成的应用也要求该系统，不能通过修改 Info.plist 来降低这个要求。
+因此面向用户的测试版优先使用下面的 GitHub 构建流程。
+
+### 在 GitHub 创建 Release 草稿
+
+1. 将发布脚本、`packaging/macos` 和 `.github/workflows/macos-release.yml` 提交并推送到
+   默认分支 `master`，保证构建需要的源码也已提交。
+2. 仓库 → **Actions** → **macOS Apple Silicon beta** → **Run workflow**。
+3. 版本填写 `0.1.0-alpha.1`（不加 `v`）；保留 **Create an unpublished GitHub prerelease draft**。
+4. 流程使用 GitHub 的 macOS 14 arm64 runner，执行 Rust 测试、构建、签名与依赖验证。
+5. 成功后可从 Actions 下载构建产物；**Releases** 中也会出现附带 ZIP、DMG、校验值和说明的草稿。
+6. 检查草稿中的实际最低系统版本和功能说明，试运行后点击 **Publish release**。
+
+流程仅在手动触发时运行，创建的是未公开的 prerelease 草稿；不会自动发布正式版。
+使用仓库自己的 `GITHUB_TOKEN` 创建草稿，仅该 job 具有 `contents: write` 权限；无需额外 PAT。
+若已有同名版本，流程会停止，不覆盖既有 Release 或附件。
+
+### 安卓触屏操作（0.1.3 起）
+
+进入标题画面后，点屏幕右上角的“菜单”，或按手机返回键，打开触屏快捷菜单。
+打开快捷菜单会暂停剧情推进和当前对白语音；“继续游戏”会恢复。
+
+| 触屏菜单 | 对应操作 |
+| --- | --- |
+| 存档 / 读档 | F6 / F8，打开档位菜单，再点档位 |
+| 快速存档 / 快速读档 | F5 / F9 |
+| 切换自动阅读 | A |
+| 开启快进 | 持续按住 Ctrl；右上角“停止快进”结束快进，后台切换也会释放 |
+| 历史记录 | B，点击历史记录可重放语音，拖动滚动条翻阅 |
+| 隐藏 / 显示文字 | H |
+| 设置 | F10 |
+| 按键面板 | 可拖动的虚拟按键：方向、确认、空格、Esc、Tab、Delete、PageUp/Down、Home/End、F7、Q、Y/N 和 Ctrl |
+
+按键面板打开时仍可触摸其余游戏区域，拖动面板标题可移动它，“收起”隐藏面板。
+存档、历史、设置中的现有按钮也都支持触摸；脚本禁止存档的位置仍遵守游戏限制。

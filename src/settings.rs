@@ -24,7 +24,7 @@ impl Default for Settings {
             text_percent: 100,
             auto_wait_ms: 1500,
             autosave: true,
-            fullscreen: false,
+            fullscreen: cfg!(target_os = "android"),
         }
     }
 }
@@ -51,6 +51,9 @@ impl Settings {
         }
     }
     fn normalize(&mut self) {
+        if cfg!(target_os = "android") {
+            self.fullscreen = true;
+        }
         self.music = self.music.min(100);
         self.sound = self.sound.min(100);
         self.voice = self.voice.min(100);
@@ -100,7 +103,7 @@ impl Settings {
             3 => self.text_percent = value.min(400) as u16,
             4 => self.auto_wait_ms = value.clamp(500, 10000),
             5 => self.autosave = value != 0,
-            _ => self.fullscreen = value != 0,
+            _ => self.fullscreen = cfg!(target_os = "android") || value != 0,
         }
     }
 }
@@ -223,6 +226,11 @@ impl Panel {
         .iter()
         .enumerate()
         {
+            let label = if row == 6 && cfg!(target_os = "android") {
+                "横屏全屏（固定）"
+            } else {
+                label
+            };
             let y = 80 + row as i32 * 48;
             if self.selected == row {
                 fill(&mut frame, Rect::new(28, y - 2, 584, 44), [35, 50, 70, 255]);

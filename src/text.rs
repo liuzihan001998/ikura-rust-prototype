@@ -112,6 +112,14 @@ pub struct TextRenderer {
     font: Font,
 }
 
+fn chinese_mode() -> bool {
+    cfg!(target_os = "android")
+        || matches!(
+            std::env::var("IKURA_LANG").as_deref(),
+            Ok("zh") | Ok("zh-CN")
+        )
+}
+
 impl TextRenderer {
     /// A clipped, single-line label for menus and notifications.
     #[allow(clippy::too_many_arguments)]
@@ -125,10 +133,7 @@ impl TextRenderer {
         px: f32,
         color: [u8; 3],
     ) {
-        let text = if matches!(
-            std::env::var("IKURA_LANG").as_deref(),
-            Ok("zh") | Ok("zh-CN")
-        ) {
+        let text = if chinese_mode() {
             match text {
                 "SETTINGS" => "设置",
                 "Music volume" => "音乐音量",
@@ -182,10 +187,7 @@ impl TextRenderer {
         } else {
             text
         };
-        let text = if matches!(
-            std::env::var("IKURA_LANG").as_deref(),
-            Ok("zh") | Ok("zh-CN")
-        ) {
+        let text = if chinese_mode() {
             localize_dynamic_label(text)
         } else {
             Cow::Borrowed(text)
@@ -203,15 +205,17 @@ impl TextRenderer {
     pub fn new() -> Result<Self, String> {
         let candidates: Vec<PathBuf> = if let Some(path) = std::env::var_os("IKURA_FONT") {
             vec![PathBuf::from(path)]
-        } else if matches!(
-            std::env::var("IKURA_LANG").as_deref(),
-            Ok("zh") | Ok("zh-CN")
-        ) {
+        } else if chinese_mode() {
             [
                 "/System/Library/Fonts/Hiragino Sans GB.ttc",
                 "/System/Library/Fonts/STHeiti Medium.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/system/fonts/NotoSansCJK-Regular.ttc",
+                "C:/Windows/Fonts/meiryo.ttc",
+                "C:/Windows/Fonts/YuGothR.ttc",
+                "C:/Windows/Fonts/msgothic.ttc",
+                "C:/Windows/Fonts/msmincho.ttc",
             ]
             .iter()
             .map(PathBuf::from)

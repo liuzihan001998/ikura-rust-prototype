@@ -3,3 +3,13 @@
 /data/zh-CN.json
 /.idea
 .DS_Store
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/assets/ikura-data.zip
+/android/app/src/main/jniLibs/
+
+/dist/
+
+__pycache__/

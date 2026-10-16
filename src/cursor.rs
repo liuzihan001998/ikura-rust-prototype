@@ -256,7 +256,7 @@ struct NativeAnimation {
 
 pub struct GameCursors {
     data: Option<DataArchive>,
-    system: Cursor,
+    system: Option<Cursor>,
     cache: HashMap<String, NativeAnimation>,
     active: Option<(u8, Option<String>)>,
     frame: Option<usize>,
@@ -268,7 +268,11 @@ impl GameCursors {
         let data = DataArchive::load(data_dir, Some("IKURA_CURSOR_DATA"))?;
         Ok(Self {
             data,
-            system: Cursor::from_system(SystemCursor::Arrow)?,
+            system: if cfg!(target_os = "android") {
+                None
+            } else {
+                Some(Cursor::from_system(SystemCursor::Arrow)?)
+            },
             cache: HashMap::new(),
             active: None,
             frame: None,
@@ -277,6 +281,9 @@ impl GameCursors {
     }
 
     pub fn update(&mut self, id: u8, name: Option<&str>) -> Result<(), String> {
+        if cfg!(target_os = "android") {
+            return Ok(());
+        }
         let changed = self
             .active
             .as_ref()
@@ -310,7 +317,9 @@ impl GameCursors {
                         .insert(name.into(), NativeAnimation { timing, cursors });
                 }
             } else {
-                self.system.set();
+                if let Some(system) = &self.system {
+                    system.set();
+                }
                 if name.is_some() {
                     eprintln!(
                         "Cursor DATA unavailable; using system arrow for IC {id}. Set IKURA_CURSOR_DATA."

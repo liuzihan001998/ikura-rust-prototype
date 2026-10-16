@@ -1,0 +1,87 @@
+name: macOS Apple Silicon beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Beta version, e.g. 0.1.0-alpha.1 (without v)'
+        required: true
+        default: '0.1.0-alpha.1'
+        type: string
+      create_release_draft:
+        description: 'Create an unpublished GitHub prerelease draft with the packages'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-beta-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      CARGO_TERM_COLOR: always
+      INPUT_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Install build dependencies
+        run: |
+          brew install pkg-config sdl2 sdl2_mixer ffmpeg
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Test Rust runtime
+        run: cargo test --locked
+      - name: Build self-contained application, ZIP and DMG
+        run: python3 tools/package_macos.py --version "$INPUT_VERSION"
+      - name: Verify bundle without Homebrew on PATH
+        run: python3 tools/verify_macos_bundle.py "dist/macos-v${INPUT_VERSION}-arm64/Ikura.app"
+      - name: Retain downloadable build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-apple-silicon-beta
+          path: |
+            dist/macos-*-arm64/*.zip
+            dist/macos-*-arm64/*.dmg
+            dist/macos-*-arm64/SHA256SUMS
+            dist/macos-*-arm64/RELEASE_NOTES.md
+            dist/macos-*-arm64/README.zh-CN.md
+          if-no-files-found: error
+          compression-level: 0
+
+  release-draft:
+    if: ${{ inputs.create_release_draft }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      INPUT_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-apple-silicon-beta
+          path: artifacts
+      - name: Create unpublished prerelease draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find artifacts -type f \( -name '*.zip' -o -name '*.dmg' -o -name SHA256SUMS -o -name README.zh-CN.md \))
+          notes="$(find artifacts -name RELEASE_NOTES.md -type f -print -quit)"
+          test -n "$notes"
+          test "${#files[@]}" -ge 4
+          gh release create "v${INPUT_VERSION}" "${files[@]}" \
+            --repo "$GH_REPO" --target "$RELEASE_COMMIT" \
+            --title "Ikura v${INPUT_VERSION} — macOS Apple Silicon beta" \
+            --notes-file "$notes" --draft --prerelease
